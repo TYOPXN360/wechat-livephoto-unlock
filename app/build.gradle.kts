@@ -1,5 +1,3 @@
-import java.util.Properties
-
 plugins {
     alias(libs.plugins.android.application)
 }
@@ -53,6 +51,10 @@ android {
         abortOnError = false
         checkReleaseBuilds = false
     }
+}
+
+kotlin {
+    jvmToolchain(17)
 }
 
 dependencies {
