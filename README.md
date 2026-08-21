@@ -79,7 +79,7 @@ META-INF/xposed/           ← libxposed API 102 注册文件
 - **补丁可能按厂商定向下发**：服务端可能仅对白名单厂商（OPPO/vivo/Xiaomi/samsung 等）下发包含真实 `LivePhotoCore` 的 Tinker 补丁。Pixel（厂商名 `Google`）等非白名单机型可能**收不到补丁**，此时模块只能解锁 UI，功能层面仍受桩类限制。可观察 `tinker-boots-install-info`（微信数据目录 `shared_prefs/tinker_patch_share_config.xml`）判断补丁是否落地。
 - 微信版本升级后类名/结构可能变化 → hook 静默降级，不影响微信正常运行
 - 换账号需重新写 G6（uin 绑定 MMKV 文件）
-- 补丁灰度周期可能为数天到数周，请保持耐心
+- 补丁检查节奏约 12 小时一次（`check_tinker_update_interval`，APK 写死，服务端可调），非白名单机型可能长期收不到补丁——此时模块只能解锁 UI，功能层面保持桩类限制
 
 ## 风控免责声明
 
