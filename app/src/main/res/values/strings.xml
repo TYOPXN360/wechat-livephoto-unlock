@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="module_description">微信实况照片解锁：绕过厂商白名单（libxposed API 102）</string>
+</resources>
