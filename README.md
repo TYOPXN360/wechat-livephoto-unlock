@@ -72,7 +72,11 @@ META-INF/xposed/           ← libxposed API 102 注册文件
 
 ## 注意事项
 
+- **补丁未下发时，只能查看实况，无法发送**：实况照片的识别、发送、保存依赖 Tinker 补丁中的真实 `LivePhotoCore` 实现。补丁未落地时：
+  - ✅ 可接收/查看别人发的实况照片（系统级解码，不依赖补丁）
+  - ❌ 聊天相册中自己的实况照片**不显示 LIVE 标记**（`isLivePhoto` 桩类返回空）
+  - ❌ 无法发送、保存、导出实况（`exportLivePhoto` 桩类返回 -1000，提示"保存失败"）
+- **补丁可能按厂商定向下发**：服务端可能仅对白名单厂商（OPPO/vivo/Xiaomi/samsung 等）下发包含真实 `LivePhotoCore` 的 Tinker 补丁。Pixel（厂商名 `Google`）等非白名单机型可能**收不到补丁**，此时模块只能解锁 UI，功能层面仍受桩类限制。可观察 `tinker-boots-install-info`（微信数据目录 `shared_prefs/tinker_patch_share_config.xml`）判断补丁是否落地。
 - 微信版本升级后类名/结构可能变化 → hook 静默降级，不影响微信正常运行
 - 换账号需重新写 G6（uin 绑定 MMKV 文件）
-- 需要服务端下发 Tinker 补丁后才能使用完整功能（保存/发送/导出）
 - 补丁灰度周期可能为数天到数周，请保持耐心
