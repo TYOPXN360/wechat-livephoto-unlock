@@ -1,89 +1,80 @@
 # LivePhotoUnlock — 微信实况照片解锁（libxposed Modern API 102）
 
-绕过微信 8.0.77 的厂商白名单，让**任何机型**（包括 Pixel、三星等）都能使用实况照片（Live Photo）功能。
+让**任何机型**（包括 Pixel、三星等非白名单设备）完整使用微信实况照片（Live Photo）功能：相册 LIVE 识别、聊天/朋友圈发送、接收查看、保存导出——**无需等待官方热补丁**。
 
 ## 原理
 
-微信 8.0.77 的实况照片功能有三层闸门：
+逆向确认的核心事实：
 
 ```
-厂商白名单（OPPO/vivo/Xiaomi/samsung 等 9 家）→ 读 Build.MANUFACTURER
-  ↓ 不匹配时可被 G6 云控开关跳过
-  ↓ 再通过 → 初始化 LivePhotoCore（APK 内的桩类，返回 -1000）
-  ↓ 桩类失败 → wp.b.e = false → 所有 UI 闸门关闭
+1. 所有官方 APK / Tinker 补丁里的 com.motion.core.LivePhotoCore 都是桩类：
+   initCore → -1000，isLivePhoto → 空表，exportLivePhoto → -1000
+2. 判定语义是【返回 0 才算成功】：wp.b.e = (initCore() == 0)
+   → 纯 APK 在任何机型上都没有完整的实况能力
+3. 厂商白名单（OPPO/vivo/Xiaomi/HONOR/samsung 等）只决定是否尝试创建核心实例，
+   不提供实现本身
+4. 聊天实况播放门控 = RepairerConfig_Chatting_C2C_Live_Preview_V2 == 1 且 wp.b.e
+   接收消息自带 xxx.jpg + xxx.jpg_lp（视频伴生文件），播放不依赖核心
 ```
 
-本模块使用**两阶段自动切换策略**：
+本模块的做法：**模拟真核心**。hook 桩类的全部方法，提供可工作的实现：
 
-### 阶段一（无补丁时）
+| 桩方法 | 模块实现 | 打通的功能 |
+|---|---|---|
+| `initCore(Context)` | 返回 0 | 总开关 e=true |
+| `isSupport()` | 返回 true | 初始化流程放行 |
+| `isLivePhoto(List<Long>)` | MediaStore 解析路径 + 文件尾部 MP4 特征扫描（兼容 Google/Xiaomi 等内嵌式动态照片） | **相册 LIVE 角标、可选实况** |
+| `getVideoMetaData(id, savePath)` | 从源图提取内嵌 MP4 写入 savePath，返回 `{errorCode, videoPath, videoSize, videoDuration}`（时长解析自 mvhd box） | 预览、发送的视频数据 |
+| `exportLivePhoto(String json)` | 按 MMLivePhotoExportData JSON 输出动态 JPEG（图+视频拼接）+ 封面 | 保存到相册 |
 
-- **wp/b.<clinit> hook**：原生 `<clinit>` 完整执行（上报与不支持机型完全一致），然后强制 `e=true`
-- **Repairer 配置写入**：`C2C_Live_Preview_V2 = 1`（聊天实况预览开关）+ `C2C_Live_Send_V4 = 1`（发送开关）
-- **云控发送开关**：`clicfg_chatting_c2c_live_send_v4 = 1`（expt MMKV）
-- **效果**：实况照片 UI 出现（接收/发送入口），在线使用触发服务端下发 Tinker 补丁
+配置门控写入带**持久收敛机制**：
 
-### 阶段二（补丁落地后）
+- 写后读回校验，未确认不算完成
+- 触发点三重保险：`Instrumentation.callApplicationOnCreate` 之后立即 + 定时重试（0/8/20/40s）+ 每 10 秒周期兜底 + 每次 Activity.onResume 兜底
+- 抵御 Tinker 补丁加载导致的 MMKV 初始化时序漂移
 
-- 检测到 `tinker-boots-install-info` 非空 → 自动写入 G6 云控开关 + 杀微信进程
-- 用户禁用模块并重启 → 微信原生读取 G6 → 跳过厂商白名单 → 补丁真实类接管 → **永久解锁，彻底摆脱 hook**
+**补丁自退位**：一旦检测到已安装的 Tinker 补丁（`tinker-boots-install-info` 非空），所有核心方法 hook 自动放行原生实现——若腾讯下发了真核心，模块自动让路。
 
-### 风控安全
+## 已验证功能矩阵
 
-- 不 hook 桩类方法（`initCore`/`isSupport`/`getCoreMetaData`）：避免自相矛盾的上报
-- 不改系统属性（`Build.MANUFACTURER`/`SDK_INT`）：Java 与 native 上报全链路一致
-- `<clinit>` 原生上报（`can_use_livePhoto=-1` 等）与任何不支持机型完全一致
-- 所有配置写入都是微信官方 MMKV 存储（`Repairer` / `WxExptAppKeyMmkv`），纯本地持久化
+| 功能 | 状态 |
+|---|---|
+| 相册 LIVE 角标识别（66 张中识别 39 张动态照片） | ✅ |
+| 聊天选择实况并发送 | ✅ |
+| 朋友圈发表实况 | ✅ |
+| 接收查看聊天实况（动图播放） | ✅ |
+| 接收查看朋友圈实况 | ✅ |
+| 保存到相册（带 LIVE 标记） | ✅ |
+
+测试环境：小米机型 + 非白名单账号，微信 8.0.7x。
 
 ## 构建
 
 ```bash
-# 环境要求
-# JDK 17+
-# Android SDK（compileSdk 37, build-tools 36.0.0+）
-# Gradle 9.4.1（wrapper 自动下载）
+# 环境要求：JDK 17+、Android SDK（compileSdk 37）
+# 配置 local.properties: sdk.dir=/path/to/android-sdk
 
-# 配置 local.properties
-sdk.dir=/path/to/your/android-sdk
-
-# 编译
 ./gradlew :app:assembleRelease
 ```
 
-产物：`app/build/outputs/apk/release/app-release.apk`（约 10KB，已签名）
+产物：`app/build/outputs/apk/release/app-release.apk`
 
 ## 安装使用
 
-1. 需 LSPosed（支持 libxposed API 102）
-2. 安装 APK，LSPosed 中启用模块，作用域勾选 `com.tencent.mm`
-3. 重启微信，模块自动进入阶段一（实况入口出现）
-4. 在线使用，等待服务端下发 Tinker 补丁（微信自动检查，可多次重启加速）
-5. 补丁落地后模块自动写 G6 固化并杀微信
-6. LSPosed 禁用模块，重启微信 → 原生永久解锁
-
-## 项目结构
-
-```
-LivePhotoUnlockHook.java   ← 核心 hook 逻辑（两阶段自动切换）
-META-INF/xposed/           ← libxposed API 102 注册文件
-  ├── java_init.list       ← 入口类注册
-  ├── module.prop          ← 模块配置（minApiVersion=102）
-  └── scope.list           ← 作用域（com.tencent.mm）
-```
+1. 需要 LSPosed（支持 libxposed API 102）
+2. 安装 APK → LSPosed 启用模块 → 作用域勾选 `com.tencent.mm`
+3. 重启微信即可，全部功能自动生效，无需等待任何补丁
 
 ## 注意事项
 
-- **补丁未下发时，只能查看实况，无法发送**：实况照片的识别、发送、保存依赖 Tinker 补丁中的真实 `LivePhotoCore` 实现。补丁未落地时：
-  - ✅ 可接收/查看别人发的实况照片（系统级解码，不依赖补丁）
-  - ❌ 聊天相册中自己的实况照片**不显示 LIVE 标记**（`isLivePhoto` 桩类返回空）
-  - ❌ 无法发送、保存、导出实况（`exportLivePhoto` 桩类返回 -1000，提示"保存失败"）
-- **补丁可能按厂商定向下发**：服务端可能仅对白名单厂商（OPPO/vivo/Xiaomi/samsung 等）下发包含真实 `LivePhotoCore` 的 Tinker 补丁。Pixel（厂商名 `Google`）等非白名单机型可能**收不到补丁**，此时模块只能解锁 UI，功能层面仍受桩类限制。可观察 `tinker-boots-install-info`（微信数据目录 `shared_prefs/tinker_patch_share_config.xml`）判断补丁是否落地。
-- 微信版本升级后类名/结构可能变化 → hook 静默降级，不影响微信正常运行
-- 换账号需重新写 G6（uin 绑定 MMKV 文件）
-- 补丁检查节奏约 12 小时一次（`check_tinker_update_interval`，APK 写死，服务端可调），非白名单机型可能长期收不到补丁——此时模块只能解锁 UI，功能层面保持桩类限制
+- 微信版本升级后混淆类名可能变化 → hook 静默降级，不影响微信正常运行（当前适配 `wp.b` 命名体系）
+- 未安装模块的接收方如果其微信没有实况能力，看到的将是静态图片（与普通不支持机型的表现一致）；白名单真机用户收到的可正常查看
+- 长按相册中的实况条目会复制一段内部状态字符串——这是微信官方自带的灰度调试功能，无害
+- 日志标签：LSPosed 日志中过滤 `LivePhotoUnlock` 可观察各环节执行情况
 
 ## 风控免责声明
 
 - 本模块用于个人技术研究，通过修改微信本地配置/内存行为解锁功能
 - **使用本模块可能触发微信风控（账号异常、功能受限、封号等），本模块不承担任何责任**
-- 模块不伪造系统属性、不改动上报内容，但 LSPosed/Xposed 环境本身会被微信 root 检测标记
-- **强烈建议使用测试小号验证，风险自负**
+- 模块不伪造系统属性、不改动网络上报内容；但 LSPosed/Xposed 环境本身可能被检测标记
+- **强烈建议先在测试小号上验证，稳定观察数日后再考虑日常使用，风险自负**
