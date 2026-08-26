@@ -183,6 +183,115 @@ class LivePhotoUnlockHook : XposedModule() {
             log(Log.ERROR, TAG, "core hook setup failed", t)
         }
 
+        // ----- wp/b.b() 校验放行（放行 ratio error / 格式不兼容等所有校验） -----
+        try {
+            val wpb = Class.forName(CLS_MM_LIVE_PHOTO, false, loader)
+            val bMethod = wpb.getDeclaredMethod(
+                "b", Long::class.javaPrimitiveType, String::class.java,
+                String::class.java, Long::class.javaPrimitiveType
+            )
+            hook(bMethod)
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { chain ->
+                    val result = chain.proceed()
+                    if (result != null) {
+                        try {
+                            val cls = result.javaClass
+                            val t0 = cls.getDeclaredField("a").apply { isAccessible = true }.get(result)
+                            if (t0 != null) {
+                                val t0Cls = t0.javaClass
+                                val successField = t0Cls.getDeclaredField("a").apply { isAccessible = true }
+                                val origSuccess = successField.getBoolean(t0)
+                                successField.setBoolean(t0, true)
+                                val errField = t0Cls.getDeclaredField("b").apply { isAccessible = true }
+                                val origErr = errField.getInt(t0)
+                                if (!origSuccess) {
+                                    errField.setInt(t0, 0)
+                                }
+                                if (!origSuccess) {
+                                    val mediaId = (chain.getArgs().firstOrNull() as? Number)?.toLong() ?: -1L
+                                    log(Log.INFO, TAG, "wp/b.b forced: origSuccess=false origErr=$origErr -> true id=$mediaId")
+                                }
+                            }
+                        } catch (t: Throwable) {
+                            log(Log.WARN, TAG, "wp/b.b force success failed", t)
+                        }
+                    }
+                    result
+                }
+        } catch (_: Throwable) {}
+
+        // ----- 强制聊天实况门控（已验证对聊天查看有效） -----
+        try {
+            val nm5f = Class.forName("nm5.f", false, loader)
+            val aMethod = nm5f.getDeclaredMethod("a")
+            hook(aMethod)
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { _ -> true }
+        } catch (_: Throwable) {}
+
+        // ----- 设备 HEVC 硬件编码能力放行（让 Pixel 走硬件编码器，不卡软编） -----
+        try {
+            val checkerCls = Class.forName("px3.n", false, loader)
+            for (m in checkerCls.methods) {
+                if (m.name == "c" && m.parameterTypes.size == 1 && m.returnType == Boolean::class.javaPrimitiveType) {
+                    hook(m)
+                        .setPriority(PRIORITY_HIGHEST)
+                        .intercept { _ -> true }
+                    break
+                }
+            }
+        } catch (_: Throwable) {}
+
+        // ----- 直通 Remux 转码：作为兜底双保险 -----
+        try {
+            val remuxCls = Class.forName("yt4.b0", false, loader)
+            for (m in remuxCls.methods) {
+                if (m.name == "Vi" && m.parameterTypes.size == 5) {
+                    hook(m)
+                        .setPriority(PRIORITY_HIGHEST)
+                        .intercept { chain ->
+                            val args = chain.getArgs()
+                            val srcPath = args[0] as? String ?: ""
+                            val dstPath = args[1] as? String ?: ""
+                            log(Log.INFO, TAG, "yt4.b0.Vi remux bypass: src=$srcPath dst=$dstPath")
+                            var copyOk = false
+                            if (srcPath.isNotEmpty() && dstPath.isNotEmpty()) {
+                                try {
+                                    val src = File(srcPath)
+                                    val dst = File(dstPath)
+                                    dst.parentFile?.mkdirs()
+                                    if (src.isFile && src.length() > 0L) {
+                                        src.copyTo(dst, overwrite = true)
+                                        copyOk = true
+                                        log(Log.INFO, TAG, "remux bypass copy ok: ${src.length()}B -> $dstPath")
+                                    }
+                                } catch (t: Throwable) {
+                                    log(Log.ERROR, TAG, "remux bypass copy failed", t)
+                                }
+                            }
+                            // 构造 re0.e(result=true, errCode=0) 返回
+                            try {
+                                val resCls = Class.forName("re0.e", false, loader)
+                                val ctor = resCls.getDeclaredConstructor(
+                                    Boolean::class.javaPrimitiveType,
+                                    Int::class.javaPrimitiveType
+                                )
+                                ctor.isAccessible = true
+                                ctor.newInstance(copyOk, 0)
+                            } catch (t: Throwable) {
+                                log(Log.WARN, TAG, "re0.e construct failed, fallback proceed", t)
+                                chain.proceed()
+                            }
+                        }
+                    log(Log.INFO, TAG, "yt4.b0.Vi remux bypass hooked")
+                    break
+                }
+            }
+        } catch (t: Throwable) {
+            log(Log.WARN, TAG, "remux bypass hook setup failed (non-fatal)", t)
+        }
+
         // ----- MMKV.initialize / mmkvWithID 钩子（补丁版 MMKV） -----
         try {
             val mmkvCls = Class.forName(MMKV_CLASS, false, loader)
@@ -332,10 +441,12 @@ class LivePhotoUnlockHook : XposedModule() {
             }
             synchronized(sVideoSource) { sVideoSource[dst.absolutePath] = srcPath }
             val durationMs = parseMvhdDurationMs(data, off)
+            val (w, h) = parseTkhdSize(data, off)
             val durField = if (durationMs > 0L) ",\"videoDuration\":$durationMs" else ""
+            val sizeField = if (w > 0 && h > 0) ",\"videoWidth\":$w,\"videoHeight\":$h" else ""
             val json =
                 "{\"errorCode\":0,\"videoPath\":\"${dst.absolutePath.replace("\\", "\\\\")}\"," +
-                    "\"videoSize\":${data.size - off}$durField}"
+                    "\"videoSize\":${data.size - off}$durField$sizeField,\"coverTimeStampMs\":0}"
             json
         } catch (t: Throwable) {
             log(Log.ERROR, TAG, "tryExtractVideo($srcPath) failed", t)
@@ -498,6 +609,32 @@ class LivePhotoUnlockHook : XposedModule() {
         return -1
     }
 
+    /** 在视频数据里找 tkhd box 解析宽高（16.16 定点数→整数）；失败返回 (0,0) */
+    private fun parseTkhdSize(data: ByteArray, from: Int): Pair<Int, Int> {
+        return try {
+            var i = from
+            val end = data.size - 4
+            while (i < end) {
+                if (data[i] == 't'.code.toByte() && data[i + 1] == 'k'.code.toByte() &&
+                    data[i + 2] == 'h'.code.toByte() && data[i + 3] == 'd'.code.toByte()
+                ) {
+                    val boxSize = readI32(data, i - 4)
+                    if (boxSize in 80..4096) {
+                        val p = i + 4 // version 字节
+                        val off = if (data[p].toInt() == 1) 88 else 76
+                        val w = ((readI32(data, p + off).toLong() and 0xFFFFFFFFL) ushr 16).toInt()
+                        val h = ((readI32(data, p + off + 4).toLong() and 0xFFFFFFFFL) ushr 16).toInt()
+                        if (w in 2..19200 && h in 2..19200) return Pair(w, h)
+                    }
+                }
+                i++
+            }
+            0 to 0
+        } catch (_: Throwable) {
+            0 to 0
+        }
+    }
+
     // ==================== 配置写入（持久收敛：读回校验 + 多触发点） ====================
 
     private val sWriteLock = Any()
@@ -543,22 +680,18 @@ class LivePhotoUnlockHook : XposedModule() {
             var dirty = false
             val mkv = if (!sPreviewDone || !sSendDone) mmkv(MMKV_REPAIRER) else null
 
-            // ---- Repairer 预览开关（写后读回校验）----
-            if (!sPreviewDone && mkv != null) {
-                mmkvPutInt(mkv, KEY_REPAIRER_PREVIEW, 1); mmkvSync(mkv)
-                if (mmkvGetInt(mkv, KEY_REPAIRER_PREVIEW, 0) == 1) {
-                    sPreviewDone = true; dirty = true
-                    log(Log.INFO, TAG, "Repairer written+verified: $KEY_REPAIRER_PREVIEW=1")
+            // ---- 批量写入所有实况相关 Repairer 配置 ----
+            for (key in ALL_REPAIRER_KEYS) {
+                // Hevc_Soft_Encode 置 0（禁用软编，走硬件硬编通道）
+                val targetVal = if (key == "RepairerConfig_Chatting_C2C_Live_Hevc_Soft_Encode") 0 else 1
+                if (mkv != null && mmkvGetInt(mkv, key, -1) != targetVal) {
+                    mmkvPutInt(mkv, key, targetVal); mmkvSync(mkv)
+                    dirty = true
+                    log(Log.INFO, TAG, "Repairer written: $key=$targetVal")
                 }
             }
-            // ---- Repairer 发送开关 ----
-            if (!sSendDone && mkv != null) {
-                mmkvPutInt(mkv, KEY_REPAIRER_SEND, 1); mmkvSync(mkv)
-                if (mmkvGetInt(mkv, KEY_REPAIRER_SEND, 0) == 1) {
-                    sSendDone = true; dirty = true
-                    log(Log.INFO, TAG, "Repairer written+verified: $KEY_REPAIRER_SEND=1")
-                }
-            }
+            sPreviewDone = true
+            sSendDone = true
             // ---- 云控 expt 发送开关 ----
             if (!sExptDone) {
                 val uin = ctx.getSharedPreferences(SP_SYSTEM_CONFIG, Application.MODE_PRIVATE)
@@ -730,8 +863,17 @@ class LivePhotoUnlockHook : XposedModule() {
 
         private const val MMKV_CLASS = "com.tencent.mmkv.MMKV"
         private const val MMKV_REPAIRER = "Repairer"
-        private const val KEY_REPAIRER_PREVIEW = "RepairerConfig_Chatting_C2C_Live_Preview_V2"
-        private const val KEY_REPAIRER_SEND = "RepairerConfig_Chatting_C2C_Live_Send_V4"
+        private val ALL_REPAIRER_KEYS = arrayOf(
+            "RepairerConfig_Chatting_C2C_Live_Preview_V2",
+            "RepairerConfig_Chatting_C2C_Live_Send_V4",
+            "RepairerConfig_Chatting_C2C_Live_Album_Auto_Enable",
+            "RepairerConfig_Chatting_C2C_Live_Hevc_Soft_Encode",
+            "RepairerConfig_SnsSaveLivePhoto",
+            "RepairerConfig_SnsPublishLivePhoto",
+            "RepairerConfig_SnsCheckSysLivePhoto",
+            "RepairerConfig_SnsPreDownloadLivePhoto",
+            "RepairerConfig_TextStatus_Gallery_LivePhoto_Enable",
+        )
 
         private const val SP_SYSTEM_CONFIG = "system_config_prefs"
         private const val KEY_UIN = "default_uin"

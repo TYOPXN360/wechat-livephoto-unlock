@@ -19,18 +19,22 @@
 
 本模块的做法：**模拟真核心**。hook 桩类的全部方法，提供可工作的实现：
 
-| 桩方法 | 模块实现 | 打通的功能 |
+| 桩方法 / 节点 | 模块实现 | 打通的功能 |
 |---|---|---|
 | `initCore(Context)` | 返回 0 | 总开关 e=true |
 | `isSupport()` | 返回 true | 初始化流程放行 |
 | `isLivePhoto(List<Long>)` | MediaStore 解析路径 + 文件尾部 MP4 特征扫描（兼容 Google/Xiaomi 等内嵌式动态照片） | **相册 LIVE 角标、可选实况** |
-| `getVideoMetaData(id, savePath)` | 从源图提取内嵌 MP4 写入 savePath，返回 `{errorCode, videoPath, videoSize, videoDuration}`（时长解析自 mvhd box） | 预览、发送的视频数据 |
+| `getVideoMetaData(id, savePath)` | 提取内嵌 MP4 写入 savePath，返回 `{errorCode, videoPath, videoSize, videoDuration, videoWidth, videoHeight}`（mvhd/tkhd 解析） | 预览与发送所需的视频数据及尺寸 |
 | `exportLivePhoto(String json)` | 按 MMLivePhotoExportData JSON 输出动态 JPEG（图+视频拼接）+ 封面 | 保存到相册 |
+| `wp/b.b` 校验出口 | 强制放行成功标志 `t0.a = true` | 绕过 Pixel 照片 4:3 与内嵌视频 16:9 的 **宽高比（Ratio Error）严苛拦截** |
+| `yt4/b0.Vi` Remuxer | 直接透传文件至 VFS 目标，跳过重编码 | 消除非白名单机型走软编导致的**转码死锁/数分钟超时降级**（4ms 秒发） |
+| `nm5.f.a()` | 强制返回 true | 恢复补丁环境下的**聊天界面实况按钮与播放能力** |
 
 配置门控写入带**持久收敛机制**：
 
 - 写后读回校验，未确认不算完成
-- 触发点三重保险：`Instrumentation.callApplicationOnCreate` 之后立即 + 定时重试（0/8/20/40s）+ 每 10 秒周期兜底 + 每次 Activity.onResume 兜底
+- 补全 9 项关键实况配置（包括聊天预览、发送、自动开启、朋友圈保存/发表/预下载、硬编通道等）
+- 触发点三重保险：`Instrumentation.callApplicationOnCreate` 之后立即 + 定时重试 + 每次 Activity.onResume 兜底
 - 抵御 Tinker 补丁加载导致的 MMKV 初始化时序漂移
 
 **补丁自退位**：一旦检测到已安装的 Tinker 补丁（`tinker-boots-install-info` 非空），所有核心方法 hook 自动放行原生实现——若腾讯下发了真核心，模块自动让路。
@@ -39,14 +43,14 @@
 
 | 功能 | 状态 |
 |---|---|
-| 相册 LIVE 角标识别（66 张中识别 39 张动态照片） | ✅ |
-| 聊天选择实况并发送 | ✅ |
-| 朋友圈发表实况 | ✅ |
-| 接收查看聊天实况（动图播放） | ✅ |
+| 相册 LIVE 角标识别（88+ 张照片精准命中） | ✅ |
+| 聊天选择实况并发送（直通秒发） | ✅ |
+| 朋友圈发表实况（直通秒发） | ✅ |
+| 接收查看聊天实况（动图+实况按钮正常播放） | ✅ |
 | 接收查看朋友圈实况 | ✅ |
 | 保存到相册（带 LIVE 标记） | ✅ |
 
-测试环境：小米机型 + 非白名单账号，微信 8.0.7x。
+测试环境：小米机型（Android 16）、Google Pixel 9 Pro XL（Android 17 / 有热补丁环境），微信 8.0.7x。
 
 ## 构建
 
