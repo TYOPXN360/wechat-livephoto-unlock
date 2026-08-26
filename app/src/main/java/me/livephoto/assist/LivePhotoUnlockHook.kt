@@ -14,38 +14,32 @@ import java.io.File
 import java.io.RandomAccessFile
 
 /**
- * 微信实况照片解锁 v2 —— B线第一阶段：模拟"真核心"（libxposed 102，纯 Kotlin）。
+ * 微信实况照片解锁（libxposed 102，纯 Kotlin）。
  *
- * 修正后的核心模型（逆向结论）：
+ * 核心模型（逆向结论）：
  *   - 所有官方 APK/补丁里的 com.motion.core.LivePhotoCore 都是桩类：
  *     initCore/exportLivePhoto 返回 -1000，isLivePhoto 返回空表，
  *     且判定语义是【返回 0 才算成功】→ 纯 APK 在任何机型上都没有完整实况能力。
  *   - 厂商白名单（小米/OV/荣耀等）只决定是否创建核心实例（wp.b.b），
  *     不提供实现本身；能用的设备必然运行着带真核心的构建。
  *   - 聊天查看门控 nm5/f.a() = RepairerConfig_Chatting_C2C_Live_Preview_V2==1 && wp.b.e
- *     播放数据链路 wp/b.b() 第一步检查 wp.b.b != null → Pixel 上为 null 直接失败；
- *     朋友圈走独立播放器所以只靠 e=true 就能看。
  *
- * 本版改动（在 v1 基础上）：
- *   1. clinit 后除了 e=true，还反射创建 LivePhotoCore 实例并写入静态字段 b
- *      （消除所有 "livePhotoCore is null" 短路）。
- *   2. hook 桩类全部方法：
- *        initCore          → 返回 0（成功）
- *        isSupport         → 返回 true
- *        getVideoMetaData  → 尽力而为：mediaId 按 MediaStore 图片解析出文件路径，
- *                            从 JPEG 尾部扫描内嵌 MP4（ftyp box），抽取到调用方指定的
- *                            savePath，返回 {errorCode,videoPath,videoSize,videoDuration}；
- *                            无法解析时返回 "" 并打日志（采集参数语义）。
- *        isLivePhoto       → 真实识别：MediaStore 批量解析路径 + 文件尾部 MP4 特征检测，
- *                            返回真实 HashMap（相册 LIVE 角标由此点亮）。
- *        getCoreMetaData / exportLivePhoto → 本轮仅日志（采集导出流程参数语义）。
+ * 实现要点：
+ *   1. hook 注册时机：Instrumentation.callApplicationOnCreate 之后（Tinker 补丁
+ *      已挂载），用 app.classLoader 解析类——否则 hook 挂在原版类上全部失效。
+ *   2. 桩类接管：
+ *        initCore → 0、isSupport → true、getCoreMetaData → ""
+ *        isLivePhoto → 真实识别（MediaStore 解析 + 文件尾 ftyp 扫描）
+ *        getVideoMetaData → 提取内嵌 MP4 + mvhd 时长，返回微信约定 JSON
+ *        exportLivePhoto → 图+视频合成动态 JPEG（保存到相册带 LIVE 标记）
+ *   3. 配置写入持久收敛：写后读回校验；MMKV.initialize/mmkvWithID 双钩子对齐
+ *      微信生命周期；补丁版 MMKV 需先 initialize（幂等），有重入保护防递归。
+ *   4. 补丁自退位：检测到已安装补丁时自动放行原生实现。
  *
- * 风控面：与 v1 相同的本地 MMKV 写入保持不变；新增 hook 只覆盖腾讯自己的
- *   桩类方法（该类当前无任何功能、无上报依赖其行为），不触碰网络层与消息内容。
+ * 风控面：只写微信官方 MMKV 本地配置，hook 只覆盖腾讯无功能的桩类与 MMKV 观察点，
+ *   不触碰网络层与消息内容上报。
  */
 class LivePhotoUnlockHook : XposedModule() {
-
-    private var hostLoader: ClassLoader? = null
 
     /** 真补丁已安装时置 true：所有核心方法 hook 自动放行原生实现（模块退位） */
     @Volatile
@@ -54,131 +48,9 @@ class LivePhotoUnlockHook : XposedModule() {
     override fun onPackageReady(param: PackageReadyParam) {
         if (param.packageName != PKG_WECHAT) return
 
-        hostLoader = param.classLoader
         if (!isMainProcess()) return
 
-        // ===== 1. wp/b.<clinit> 后：e=true + 创建核心实例 b =====
-        try {
-            val wpb = Class.forName(CLS_MM_LIVE_PHOTO, false, param.classLoader)
-            hookClassInitializer(wpb)
-                .setPriority(PRIORITY_HIGHEST)
-                .intercept { chain ->
-                    val result = chain.proceed()
-                    if (nativePatchMode) {
-                        log(Log.INFO, TAG, "stage-1: native patch active, wp.b untouched")
-                        return@intercept result
-                    }
-                    val eOk = setStaticBool(wpb, "e", true)
-                    val bOk = installCoreInstance(wpb, param.classLoader)
-                    log(
-                        Log.INFO, TAG,
-                        "stage-1: wp.b clinit done, e=$eOk, b-installed=$bOk"
-                    )
-                    result
-                }
-            log(Log.INFO, TAG, "stage-1 hook registered on wp.b")
-        } catch (t: Throwable) {
-            log(Log.ERROR, TAG, "wp.b hook setup failed (version changed?)", t)
-        }
-
-        // ===== 2. LivePhotoCore 桩方法接管 =====
-        try {
-            val core = Class.forName(CLS_CORE, false, param.classLoader)
-
-            // initCore(Context)I -> 0（原生补丁模式下放行）
-            hook(core.getDeclaredMethod("initCore", Context::class.java))
-                .setPriority(PRIORITY_HIGHEST)
-                .intercept { chain ->
-                    if (nativePatchMode) {
-                        chain.proceed()
-                    } else {
-                        log(Log.INFO, TAG, "core.initCore(${argsString(chain.getArgs())}) -> 0")
-                        0
-                    }
-                }
-
-            // isSupport()Z -> true
-            hook(core.getDeclaredMethod("isSupport"))
-                .setPriority(PRIORITY_HIGHEST)
-                .intercept { chain ->
-                    if (nativePatchMode) chain.proceed() else true
-                }
-
-            // getCoreMetaData()String -> ""（本轮仅观察）
-            hook(core.getDeclaredMethod("getCoreMetaData"))
-                .setPriority(PRIORITY_HIGHEST)
-                .intercept { chain ->
-                    if (nativePatchMode) {
-                        chain.proceed()
-                    } else {
-                        log(Log.INFO, TAG, "core.getCoreMetaData() probed -> \"\"")
-                        ""
-                    }
-                }
-
-            // getVideoMetaData(J, String)String -> 尽力提取内嵌视频
-            hook(
-                core.getDeclaredMethod(
-                    "getVideoMetaData",
-                    Long::class.javaPrimitiveType, String::class.java
-                )
-            )
-                .setPriority(PRIORITY_HIGHEST)
-                .intercept { chain ->
-                    if (nativePatchMode) {
-                        chain.proceed()
-                    } else {
-                        val mediaId = (chain.getArgs()[0] as? Number)?.toLong() ?: -1L
-                        val savePath = chain.getArgs()[1] as? String ?: ""
-                        log(Log.INFO, TAG, "core.getVideoMetaData(mediaId=$mediaId, savePath=$savePath)")
-                        val json = tryExtractVideo(mediaId, savePath)
-                        if (json != null) {
-                            log(Log.INFO, TAG, "core.getVideoMetaData -> $json")
-                            json
-                        } else {
-                            log(Log.WARN, TAG, "core.getVideoMetaData -> \"\" (cannot resolve/extract)")
-                            ""
-                        }
-                    }
-                }
-
-            // isLivePhoto(List<Long>)HashMap -> 真实识别
-            hook(core.getDeclaredMethod("isLivePhoto", List::class.java))
-                .setPriority(PRIORITY_HIGHEST)
-                .intercept { chain ->
-                    if (nativePatchMode) {
-                        chain.proceed()
-                    } else {
-                        val ids = (chain.getArgs()[0] as? List<Long>) ?: emptyList()
-                        val map = detectLivePhotos(ids)
-                        log(Log.INFO, TAG, "core.isLivePhoto(${ids.size} ids) -> ${map.count { it.value }} live")
-                        map
-                    }
-                }
-
-            // exportLivePhoto(String json)I -> 真实导出：合成动态JPEG + 封面
-            hook(core.getDeclaredMethod("exportLivePhoto", String::class.java))
-                .setPriority(PRIORITY_HIGHEST)
-                .intercept { chain ->
-                    if (nativePatchMode) {
-                        chain.proceed()
-                    } else {
-                        val json = chain.getArgs()[0] as? String ?: ""
-                        val ok = tryExportLivePhoto(json)
-                        log(
-                            Log.INFO, TAG,
-                            "core.exportLivePhoto($json) -> ${if (ok) 0 else -1000}"
-                        )
-                        if (ok) 0 else chain.proceed()
-                    }
-                }
-
-            log(Log.INFO, TAG, "core hooks registered on $CLS_CORE")
-        } catch (t: Throwable) {
-            log(Log.ERROR, TAG, "core hook setup failed", t)
-        }
-
-        // ===== 3. Instrumentation.callApplicationOnCreate：比 Application.onCreate 更稳的时机 =====
+        // ===== 1. 等 Application 创建完成（Tinker 补丁已挂载）后，用最终 classloader 注册全部 hook =====
         try {
             val ins = Class.forName("android.app.Instrumentation", false, param.classLoader)
             val m = ins.getDeclaredMethod(
@@ -192,9 +64,10 @@ class LivePhotoUnlockHook : XposedModule() {
                     if (app != null) {
                         try {
                             sAppContext = app.baseContext ?: app.applicationContext
+                            registerAllHooks(app.classLoader)
                             scheduleConfigWrites()
                         } catch (t: Throwable) {
-                            log(Log.ERROR, TAG, "appOnCreate write failed", t)
+                            log(Log.ERROR, TAG, "appOnCreate failed", t)
                         }
                     }
                     result
@@ -203,7 +76,7 @@ class LivePhotoUnlockHook : XposedModule() {
             log(Log.ERROR, TAG, "Instrumentation hook setup failed", t)
         }
 
-        // ===== 4. 每次 Activity onResume 兜底重试（补丁加载可能大幅推迟 MMKV 就绪）=====
+        // ===== 2. 每次 Activity onResume 兜底重试 =====
         try {
             val ins = Class.forName("android.app.Instrumentation", false, param.classLoader)
             val m = ins.getDeclaredMethod("callActivityOnResume", android.app.Activity::class.java)
@@ -217,6 +90,129 @@ class LivePhotoUnlockHook : XposedModule() {
                 }
         } catch (t: Throwable) {
             log(Log.WARN, TAG, "onResume hook setup failed (non-fatal)", t)
+        }
+    }
+
+    /** 在补丁已加载的最终 classloader 上注册所有 hook */
+    private fun registerAllHooks(loader: ClassLoader) {
+        // ----- wp/b.<clinit> 后：e=true + 创建核心实例 b -----
+        try {
+            val wpb = Class.forName(CLS_MM_LIVE_PHOTO, false, loader)
+            hookClassInitializer(wpb)
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { chain ->
+                    val result = chain.proceed()
+                    if (nativePatchMode) {
+                        log(Log.INFO, TAG, "stage-1: native patch active, wp.b untouched")
+                        return@intercept result
+                    }
+                    val eOk = setStaticBool(wpb, "e", true)
+                    val bOk = installCoreInstance(wpb, loader)
+                    log(
+                        Log.INFO, TAG,
+                        "stage-1: wp.b clinit done, e=$eOk, b-installed=$bOk"
+                    )
+                    result
+                }
+            log(Log.INFO, TAG, "stage-1 hook registered on wp.b")
+        } catch (t: Throwable) {
+            log(Log.ERROR, TAG, "wp.b hook setup failed (version changed?)", t)
+        }
+
+        // ----- LivePhotoCore 桩方法接管 -----
+        try {
+            val core = Class.forName(CLS_CORE, false, loader)
+
+            hook(core.getDeclaredMethod("initCore", Context::class.java))
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { chain ->
+                    if (nativePatchMode) { chain.proceed() } else {
+                        log(Log.INFO, TAG, "core.initCore(${argsString(chain.getArgs())}) -> 0"); 0
+                    }
+                }
+
+            hook(core.getDeclaredMethod("isSupport"))
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { chain -> if (nativePatchMode) chain.proceed() else true }
+
+            hook(core.getDeclaredMethod("getCoreMetaData"))
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { chain ->
+                    if (nativePatchMode) chain.proceed() else {
+                        log(Log.INFO, TAG, "core.getCoreMetaData() probed -> \"\""); ""
+                    }
+                }
+
+            hook(core.getDeclaredMethod("getVideoMetaData", Long::class.javaPrimitiveType, String::class.java))
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { chain ->
+                    if (nativePatchMode) chain.proceed() else {
+                        val mediaId = (chain.getArgs()[0] as? Number)?.toLong() ?: -1L
+                        val savePath = chain.getArgs()[1] as? String ?: ""
+                        log(Log.INFO, TAG, "core.getVideoMetaData(mediaId=$mediaId, savePath=$savePath)")
+                        val json = tryExtractVideo(mediaId, savePath)
+                        if (json != null) { log(Log.INFO, TAG, "core.getVideoMetaData -> $json"); json }
+                        else { log(Log.WARN, TAG, "core.getVideoMetaData -> \"\""); "" }
+                    }
+                }
+
+            hook(core.getDeclaredMethod("isLivePhoto", List::class.java))
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { chain ->
+                    if (nativePatchMode) chain.proceed() else {
+                        val ids = (chain.getArgs()[0] as? List<Long>) ?: emptyList()
+                        val map = detectLivePhotos(ids)
+                        log(Log.INFO, TAG, "core.isLivePhoto(${ids.size} ids) -> ${map.count { it.value }} live")
+                        map
+                    }
+                }
+
+            hook(core.getDeclaredMethod("exportLivePhoto", String::class.java))
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { chain ->
+                    if (nativePatchMode) chain.proceed() else {
+                        val json = chain.getArgs()[0] as? String ?: ""
+                        val ok = tryExportLivePhoto(json)
+                        log(Log.INFO, TAG, "core.exportLivePhoto -> ${if (ok) 0 else -1000}")
+                        if (ok) 0 else chain.proceed()
+                    }
+                }
+
+            log(Log.INFO, TAG, "core hooks registered on $CLS_CORE")
+        } catch (t: Throwable) {
+            log(Log.ERROR, TAG, "core hook setup failed", t)
+        }
+
+        // ----- MMKV.initialize / mmkvWithID 钩子（补丁版 MMKV） -----
+        try {
+            val mmkvCls = Class.forName(MMKV_CLASS, false, loader)
+            for (m in mmkvCls.methods) {
+                if (m.name == "initialize" && java.lang.reflect.Modifier.isStatic(m.modifiers)) {
+                    hook(m).setPriority(PRIORITY_HIGHEST).intercept { chain ->
+                        val r = chain.proceed()
+                        // 我们自己 mmkv() 里的 initialize 调用不触发写入（防递归）
+                        if (!sInMmkvInit && !allWritesDone()) {
+                            try { attemptConfigWrites() } catch (_: Throwable) {}
+                        }
+                        r
+                    }
+                }
+            }
+            for (m in mmkvCls.methods) {
+                if (m.name == "mmkvWithID" && java.lang.reflect.Modifier.isStatic(m.modifiers)) {
+                    hook(m).setPriority(PRIORITY_HIGHEST).intercept { chain ->
+                        val r = chain.proceed()
+                        if (r != null) {
+                            val id = chain.getArgs().firstOrNull() as? String
+                            if (id != null) synchronized(sCachedMmkv) { sCachedMmkv[id] = r }
+                        }
+                        r
+                    }
+                }
+            }
+            log(Log.INFO, TAG, "MMKV initialize/mmkvWithID hooks registered")
+        } catch (t: Throwable) {
+            log(Log.WARN, TAG, "MMKV hook setup failed (non-fatal)", t)
         }
     }
 
@@ -505,47 +501,39 @@ class LivePhotoUnlockHook : XposedModule() {
     // ==================== 配置写入（持久收敛：读回校验 + 多触发点） ====================
 
     private val sWriteLock = Any()
+    /** 微信已打开的 MMKV 实例缓存（hook mmkvWithID 截获，避免补丁下直接调失败） */
+    private val sCachedMmkv = HashMap<String, Any>()
     private var sAppContext: android.content.Context? = null
     private var sPreviewDone = false
     private var sSendDone = false
     private var sExptDone = false
     private var sStage2Done = false
-    private var sRetryScheduled = false
-    private var sFailCount = 0
+    private var sAttemptCount = 0
+    private var sLastAttemptMs = 0L
 
     private fun allWritesDone(): Boolean =
         sPreviewDone && sSendDone && sExptDone && sStage2Done
 
-    /** 延迟重试（0/8/20/40s）+ 每 10s 周期兜底，全部成功后自停 */
+    /** 延迟重试（0/8s/20s），每次间隔至少 5s（防 onResume 触发刷爆） */
     private fun scheduleConfigWrites() {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
-        val delays = longArrayOf(0L, 8_000L, 20_000L, 40_000L)
+        val delays = longArrayOf(0L, 8_000L, 20_000L)
         for (d in delays) {
             handler.postDelayed({ runAttempt() }, d)
-        }
-        synchronized(sWriteLock) {
-            if (!sRetryScheduled) {
-                sRetryScheduled = true
-                val periodic = object : Runnable {
-                    override fun run() {
-                        if (allWritesDone()) return
-                        runAttempt()
-                        handler.postDelayed(this, 10_000L)
-                    }
-                }
-                handler.postDelayed(periodic, 60_000L)
-            }
         }
     }
 
     private fun runAttempt() {
+        val now = System.currentTimeMillis()
+        synchronized(sWriteLock) {
+            if (now - sLastAttemptMs < 5_000L) return // 防重入
+            sLastAttemptMs = now
+            sAttemptCount++
+        }
         try {
             attemptConfigWrites()
         } catch (t: Throwable) {
-            sFailCount++
-            if (sFailCount % 5 == 1) {
-                log(Log.WARN, TAG, "config write retry #${sFailCount} failed", t)
-            }
+            log(Log.WARN, TAG, "config write attempt #$sAttemptCount failed", t)
         }
     }
 
@@ -636,13 +624,34 @@ class LivePhotoUnlockHook : XposedModule() {
 
     // ==================== 反射 MMKV 工具 ====================
 
+    /** 正在我们的 mmkv() 里调 initialize（防止 initialize hook 里的 attemptConfigWrites 递归） */
+    @Volatile
+    private var sInMmkvInit = false
+
     private fun mmkv(mmapId: String): Any? {
-        val loader = hostLoader ?: return null
+        // 优先用微信已打开的实例缓存（hook 截获）
+        synchronized(sCachedMmkv) {
+            sCachedMmkv[mmapId]?.let { return it }
+        }
+        // 缓存没有 → 用最终 classloader 解析，先 initialize（幂等）再 mmkvWithID
+        val ctx = sAppContext ?: return null
         return try {
-            val mmkvCls = Class.forName(MMKV_CLASS, false, loader)
+            val mmkvCls = Class.forName(MMKV_CLASS, false, ctx.classLoader)
+            if (!sInMmkvInit) {
+                sInMmkvInit = true
+                try {
+                    mmkvCls.getMethod("initialize", android.content.Context::class.java)
+                        .invoke(null, ctx)
+                } catch (ie: Throwable) {
+                    log(Log.WARN, TAG, "MMKV.initialize failed: ${ie.cause ?: ie}")
+                } finally {
+                    sInMmkvInit = false
+                }
+            }
             mmkvCls.getMethod("mmkvWithID", String::class.java).invoke(null, mmapId)
         } catch (t: Throwable) {
-            log(Log.ERROR, TAG, "mmkvWithID failed: $mmapId", t)
+            val cause = (t as? java.lang.reflect.InvocationTargetException)?.cause ?: t
+            log(Log.ERROR, TAG, "mmkvWithID failed: $mmapId (${cause.javaClass.simpleName}: ${cause.message})")
             null
         }
     }

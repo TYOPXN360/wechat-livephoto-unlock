@@ -1,3 +1,22 @@
+## v2.5.0 (2026-08-27)
+
+**修复微信下发 Tinker 热补丁后模块失效的问题。**
+
+逆向发现：Tinker 补丁延迟挂载，在 `onPackageReady` 时用 `param.classLoader` 解析到的
+类是原版；而补丁安装后微信运行时实际使用的是**补丁版类**（含 MMKV 本身也被补丁替换）。
+此前所有 hook 都挂在原版类上，热补丁一到全部失效。
+
+### 修复
+- **hook 注册时机重构**：全部 hook 移至 `Instrumentation.callApplicationOnCreate`
+  之后注册，用最终 classloader（`app.classLoader`）解析类——补丁版 wp.b、
+  LivePhotoCore、MMKV 全部正确接管
+- **MMKV 兜底初始化**：补丁版 MMKV 会报 "You should Call MMKV.initialize() first"，
+  写入前先调幂等的 `MMKV.initialize(context)`，并加重入保护防止与 initialize 钩子互相递归（StackOverflowError）
+- **MMKV 实例缓存**：hook 所有 `mmkvWithID` 重载，截获微信已打开的实例优先复用
+- **配置写入收敛加固**：0/8/20s 定时重试 + Activity.onResume 兜底 + 5 秒最小间隔防刷
+
+### 清理
+- 移除无用的 hostLoader 字段；更新文件头注释为当前架构描述
 # Changelog
 
 ## v2.0.0 (2026-08-26)
