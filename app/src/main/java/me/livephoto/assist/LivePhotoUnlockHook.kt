@@ -243,10 +243,11 @@ class LivePhotoUnlockHook : XposedModule() {
             }
         } catch (_: Throwable) {}
 
-        // ----- 直通 Remux 转码：作为兜底双保险 -----
+        // ----- 直通 Remux 转码：跳过软/硬编直接复制目标文件（解决聊天与朋友圈转码卡死/降级/发表失败） -----
         try {
             val remuxCls = Class.forName("yt4.b0", false, loader)
             for (m in remuxCls.methods) {
+                // 1. 聊天 C2C 实况转码直通 (Vi: 5 参数)
                 if (m.name == "Vi" && m.parameterTypes.size == 5) {
                     hook(m)
                         .setPriority(PRIORITY_HIGHEST)
@@ -254,7 +255,8 @@ class LivePhotoUnlockHook : XposedModule() {
                             val args = chain.getArgs()
                             val srcPath = args[0] as? String ?: ""
                             val dstPath = args[1] as? String ?: ""
-                            log(Log.INFO, TAG, "yt4.b0.Vi remux bypass: src=$srcPath dst=$dstPath")
+                            val thumbPath = args.getOrNull(2) as? String ?: ""
+                            log(Log.INFO, TAG, "chat remux bypass: src=$srcPath dst=$dstPath thumb=$thumbPath")
                             var copyOk = false
                             if (srcPath.isNotEmpty() && dstPath.isNotEmpty()) {
                                 try {
@@ -264,13 +266,13 @@ class LivePhotoUnlockHook : XposedModule() {
                                     if (src.isFile && src.length() > 0L) {
                                         src.copyTo(dst, overwrite = true)
                                         copyOk = true
-                                        log(Log.INFO, TAG, "remux bypass copy ok: ${src.length()}B -> $dstPath")
+                                        log(Log.INFO, TAG, "chat remux copy ok: ${src.length()}B -> $dstPath")
                                     }
                                 } catch (t: Throwable) {
-                                    log(Log.ERROR, TAG, "remux bypass copy failed", t)
+                                    log(Log.ERROR, TAG, "chat remux copy failed", t)
                                 }
                             }
-                            // 构造 re0.e(result=true, errCode=0) 返回
+                            ensureThumbFile(srcPath, thumbPath)
                             try {
                                 val resCls = Class.forName("re0.e", false, loader)
                                 val ctor = resCls.getDeclaredConstructor(
@@ -284,12 +286,125 @@ class LivePhotoUnlockHook : XposedModule() {
                                 chain.proceed()
                             }
                         }
-                    log(Log.INFO, TAG, "yt4.b0.Vi remux bypass hooked")
-                    break
+                    log(Log.INFO, TAG, "yt4.b0.Vi (chat remux) bypass hooked")
+                }
+
+                // 2. 朋友圈 SNS 实况转码直通 (Ui: 2 参数 RecordConfigProvider, Continuation)
+                if (m.name == "Ui" && m.parameterTypes.size == 2) {
+                    hook(m)
+                        .setPriority(PRIORITY_HIGHEST)
+                        .intercept { chain ->
+                            val provider = chain.getArgs()[0]
+                            var srcPath = ""
+                            var dstPath = ""
+                            var thumbPath = ""
+                            if (provider != null) {
+                                try {
+                                    val pCls = provider.javaClass
+                                    srcPath = (pCls.getField("A").get(provider) as? String)
+                                        ?: (pCls.getDeclaredField("A").apply { isAccessible = true }.get(provider) as? String) ?: ""
+                                    dstPath = (pCls.getField("B").get(provider) as? String)
+                                        ?: (pCls.getDeclaredField("B").apply { isAccessible = true }.get(provider) as? String) ?: ""
+                                    thumbPath = (pCls.getField("C").get(provider) as? String)
+                                        ?: (pCls.getDeclaredField("C").apply { isAccessible = true }.get(provider) as? String) ?: ""
+                                } catch (t: Throwable) {
+                                    log(Log.WARN, TAG, "sns remux provider read failed", t)
+                                }
+                            }
+                            log(Log.INFO, TAG, "sns remux bypass: src=$srcPath dst=$dstPath thumb=$thumbPath")
+                            var copyOk = false
+                            if (srcPath.isNotEmpty() && dstPath.isNotEmpty()) {
+                                try {
+                                    val src = File(srcPath)
+                                    val dst = File(dstPath)
+                                    dst.parentFile?.mkdirs()
+                                    if (src.isFile && src.length() > 0L) {
+                                        src.copyTo(dst, overwrite = true)
+                                        copyOk = true
+                                        log(Log.INFO, TAG, "sns remux copy ok: ${src.length()}B -> $dstPath")
+                                    }
+                                } catch (t: Throwable) {
+                                    log(Log.ERROR, TAG, "sns remux copy failed", t)
+                                }
+                            }
+                            ensureThumbFile(srcPath, thumbPath)
+                            try {
+                                val resCls = Class.forName("re0.e", false, loader)
+                                val ctor = resCls.getDeclaredConstructor(
+                                    Boolean::class.javaPrimitiveType,
+                                    Int::class.javaPrimitiveType
+                                )
+                                ctor.isAccessible = true
+                                ctor.newInstance(copyOk, 0)
+                            } catch (t: Throwable) {
+                                log(Log.WARN, TAG, "re0.e construct failed, fallback proceed", t)
+                                chain.proceed()
+                            }
+                        }
+                    log(Log.INFO, TAG, "yt4.b0.Ui (sns remux) bypass hooked")
                 }
             }
         } catch (t: Throwable) {
             log(Log.WARN, TAG, "remux bypass hook setup failed (non-fatal)", t)
+        }
+
+        // ----- Android 17 跨进程 Parcelable 脱敏传递（解决 system_server 反序列化 BadParcelableException） -----
+        try {
+            // 1. 拦截 Intent 放入 Parcelable 列表，将包含 SnsPublishLivePhotoItem 的 Extra 序列化为 byte[]
+            val intentCls = android.content.Intent::class.java
+            val putParcList = intentCls.getMethod("putParcelableArrayListExtra", String::class.java, java.util.ArrayList::class.java)
+            hook(putParcList)
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { chain ->
+                    val key = chain.getArgs()[0] as? String ?: ""
+                    val list = chain.getArgs()[1] as? java.util.ArrayList<*>
+                    val intent = chain.getThisObject() as? android.content.Intent
+                    if (intent != null && list != null && list.isNotEmpty() && list[0]?.javaClass?.name?.contains("SnsPublishLivePhotoItem") == true) {
+                        try {
+                            val parcel = android.os.Parcel.obtain()
+                            parcel.writeList(list)
+                            val bytes = parcel.marshall()
+                            parcel.recycle()
+                            intent.putExtra(PARCEL_BLOB_PREFIX + key, bytes)
+                            log(Log.INFO, TAG, "parcelable sanitized for intent: key=$key count=${list.size} bytes=${bytes.size}")
+                            return@intercept intent
+                        } catch (t: Throwable) {
+                            log(Log.WARN, TAG, "parcelable sanitization failed, fallback normal", t)
+                        }
+                    }
+                    chain.proceed()
+                }
+
+            // 2. 拦截 Intent 读取 Parcelable 列表，如果存在脱敏 byte[] 则用微信 classloader 反序列化还原
+            val getParcList = intentCls.getMethod("getParcelableArrayListExtra", String::class.java)
+            hook(getParcList)
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { chain ->
+                    val key = chain.getArgs()[0] as? String ?: ""
+                    val intent = chain.getThisObject() as? android.content.Intent
+                    val blobKey = PARCEL_BLOB_PREFIX + key
+                    if (intent != null && intent.hasExtra(blobKey)) {
+                        val bytes = intent.getByteArrayExtra(blobKey)
+                        if (bytes != null && bytes.isNotEmpty()) {
+                            try {
+                                val parcel = android.os.Parcel.obtain()
+                                parcel.unmarshall(bytes, 0, bytes.size)
+                                parcel.setDataPosition(0)
+                                val list = java.util.ArrayList<Any?>()
+                                parcel.readList(list, loader)
+                                parcel.recycle()
+                                log(Log.INFO, TAG, "parcelable restored from blob: key=$key count=${list.size}")
+                                return@intercept list
+                            } catch (t: Throwable) {
+                                log(Log.WARN, TAG, "parcelable restore failed from blob", t)
+                            }
+                        }
+                    }
+                    chain.proceed()
+                }
+            log(Log.INFO, TAG, "Android 17 Intent parcelable sanitizer hooked")
+        } catch (t: Throwable) {
+            log(Log.WARN, TAG, "parcelable sanitizer hook setup failed", t)
         }
 
         // ----- MMKV.initialize / mmkvWithID 钩子（补丁版 MMKV） -----
@@ -456,8 +571,46 @@ class LivePhotoUnlockHook : XposedModule() {
 
     // ==================== 导出：合成动态 JPEG ====================
 
-    /** videoFilePath -> 源图片路径（提取时记录，供导出阶段回查） */
+    /** videoFilePath -> 源图片路径（提取时记录，供导出与转码阶段回查） */
     private val sVideoSource = HashMap<String, String>()
+
+    /** 确保转码产物的封面缩略图存在（若不存在则从源图生成/复制，满足微信 UploadManager 的存在性校验） */
+    private fun ensureThumbFile(srcVideoPath: String, thumbPath: String) {
+        if (thumbPath.isEmpty()) return
+        val dst = File(thumbPath)
+        if (dst.isFile && dst.length() > 0L) return
+        dst.parentFile?.mkdirs()
+        // 1. 从 sVideoSource 反查原始图片提取首部纯 JPEG
+        val srcImg = synchronized(sVideoSource) { sVideoSource[srcVideoPath] }
+        if (!srcImg.isNullOrEmpty()) {
+            val f = File(srcImg)
+            if (f.isFile && f.length() > 0L) {
+                try {
+                    val data = f.readBytes()
+                    val ftypOff = findFtyp(data)
+                    val jpegLen = if (ftypOff > 0) ftypOff else data.size
+                    java.io.FileOutputStream(dst).use { it.write(data, 0, jpegLen) }
+                    log(Log.INFO, TAG, "thumb generated from srcImg: ${jpegLen}B -> $thumbPath")
+                    return
+                } catch (t: Throwable) {
+                    log(Log.WARN, TAG, "ensureThumbFile failed from $srcImg", t)
+                }
+            }
+        }
+        // 2. 兜底：在源视频同目录下找任意 jpg 作为封面
+        val dir = File(srcVideoPath).parentFile
+        if (dir != null && dir.isDirectory) {
+            val jpg = dir.listFiles { _, name -> name.endsWith(".jpg", true) || name.endsWith(".jpeg", true) }
+                ?.sortedByDescending { it.lastModified() }?.firstOrNull()
+            if (jpg != null && jpg.isFile && jpg.length() > 0L) {
+                try {
+                    jpg.copyTo(dst, overwrite = true)
+                    log(Log.INFO, TAG, "thumb copied from sibling: ${jpg.length()}B -> $thumbPath")
+                    return
+                } catch (_: Throwable) {}
+            }
+        }
+    }
 
     private fun readJpegFile(f: File): ByteArray? {
         return try {
@@ -890,6 +1043,9 @@ class LivePhotoUnlockHook : XposedModule() {
         private const val TAIL_WINDOW = 12 * 1024 * 1024
 
         private const val VAL_BASE64_ONE = "MQ=="
+
+        /** Intent 脱敏 byte[] 存储的前缀 key */
+        private const val PARCEL_BLOB_PREFIX = "__lp_blob_"
 
         private fun exptJson(exptId: Int, key: String): String =
             "{\"ExptId\":$exptId,\"GroupId\":0,\"ExptSequence\":1,\"Priority\":1,\"NeedReport\":0," +

@@ -1,5 +1,22 @@
 # Changelog
 
+## v2.7.0 (2026-08-29)
+
+**支持朋友圈实况转码直通与 Android 17 跨进程 Intent 脱敏。**
+
+### 核心突破与修复
+1. **朋友圈实况转码直通 (`yt4/b0.Ui`)**：
+   - 逆向发现朋友圈实况发表使用的是 `SnsPublishLivePhotoRemuxChain`（走 `yt4.b0.Ui` 接口）
+   - 新增针对 `Ui` 的直通复制与封面补全，解决朋友圈发表卡死几分钟超时的问题
+2. **封面缩略图自动生成补全 (`ensureThumbFile`)**：
+   - 上传管理器（UploadManager）严格校验 `remuxThumbPath` 缩略图文件是否存在
+   - 新增从源图提取 JPEG 或同目录同名补全封面逻辑，保证上传校验 100% 通过
+3. **Android 17 跨进程 Intent 脱敏 (`BadParcelableException`)**：
+   - Android 17 的 `system_server` 对 `startActivity` 传递的私有 Parcelable 做深层解包校验
+   - 拦截包含 `SnsPublishLivePhotoItem` 的 Extra 自动封装为标准 `byte[]`，接收端无损还原，避免系统层拦截丢弃跳转
+
+---
+
 ## v2.6.0 (2026-08-27)
 
 **打通发送全链路与聊天实况查看，彻底解决发送卡死、超时降级与查看黑屏问题。**
