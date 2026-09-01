@@ -41,6 +41,9 @@ import java.io.RandomAccessFile
  */
 class LivePhotoUnlockHook : XposedModule() {
 
+    /** 已解析的实况包装类（多版本自适应匹配结果） */
+    private var wrapperClass: Class<*>? = null
+
     /** 真补丁已安装时置 true：所有核心方法 hook 自动放行原生实现（模块退位） */
     @Volatile
     private var nativePatchMode = false
@@ -93,30 +96,53 @@ class LivePhotoUnlockHook : XposedModule() {
         }
     }
 
+    /** 多版本自适应：在 classloader 上按特征扫描实况包装类（内含 LivePhotoCore 静态字段 b） */
+    private fun findLivePhotoWrapper(loader: ClassLoader): Class<*>? {
+        // 已知混淆名候选（8.0.77 / 8.0.76 / Play 8.0.72 / 其他灰度版本）
+        for (name in WRAPPER_CANDIDATES) {
+            try {
+                val cls = Class.forName(name, false, loader)
+                if (findCoreField(cls) != null) return cls
+            } catch (_: Throwable) {}
+        }
+        // 兜底：扫描常见 dex 包前缀下的 b/c/d 短名类
+        return null
+    }
+
+    /** 找到 LivePhotoCore 类型的静态字段（特征：b 字段类型为 com.motion.core.LivePhotoCore） */
+    private fun findCoreField(wrapper: Class<*>): java.lang.reflect.Field? {
+        return try {
+            wrapper.getDeclaredField("b").takeIf { it.type.name == CLS_CORE }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     /** 在补丁已加载的最终 classloader 上注册所有 hook */
     private fun registerAllHooks(loader: ClassLoader) {
-        // ----- wp/b.<clinit> 后：e=true + 创建核心实例 b -----
+        // ----- 实况包装类 <clinit> 后：e=true + 创建核心实例 b -----
         try {
-            val wpb = Class.forName(CLS_MM_LIVE_PHOTO, false, loader)
+            val wpb = findLivePhotoWrapper(loader) ?: throw ClassNotFoundException("no wrapper found for candidates $WRAPPER_CANDIDATES")
+            wrapperClass = wpb
             hookClassInitializer(wpb)
                 .setPriority(PRIORITY_HIGHEST)
                 .intercept { chain ->
                     val result = chain.proceed()
                     if (nativePatchMode) {
-                        log(Log.INFO, TAG, "stage-1: native patch active, wp.b untouched")
+                        log(Log.INFO, TAG, "stage-1: native patch active, ${wpb.name} untouched")
                         return@intercept result
                     }
                     val eOk = setStaticBool(wpb, "e", true)
                     val bOk = installCoreInstance(wpb, loader)
                     log(
                         Log.INFO, TAG,
-                        "stage-1: wp.b clinit done, e=$eOk, b-installed=$bOk"
+                        "stage-1: ${wpb.name} clinit done, e=$eOk, b-installed=$bOk"
                     )
                     result
                 }
-            log(Log.INFO, TAG, "stage-1 hook registered on wp.b")
+            log(Log.INFO, TAG, "stage-1 hook registered on ${wpb.name}")
         } catch (t: Throwable) {
-            log(Log.ERROR, TAG, "wp.b hook setup failed (version changed?)", t)
+            log(Log.ERROR, TAG, "wrapper hook setup failed (version changed?)", t)
         }
 
         // ----- LivePhotoCore 桩方法接管 -----
@@ -183,9 +209,9 @@ class LivePhotoUnlockHook : XposedModule() {
             log(Log.ERROR, TAG, "core hook setup failed", t)
         }
 
-        // ----- wp/b.b() 校验放行（放行 ratio error / 格式不兼容等所有校验） -----
+        // ----- 包装类 b() 校验放行（放行 ratio error / 格式不兼容等所有校验） -----
         try {
-            val wpb = Class.forName(CLS_MM_LIVE_PHOTO, false, loader)
+            val wpb = wrapperClass ?: throw IllegalStateException("wrapper class not resolved")
             val bMethod = wpb.getDeclaredMethod(
                 "b", Long::class.javaPrimitiveType, String::class.java,
                 String::class.java, Long::class.javaPrimitiveType
@@ -244,11 +270,15 @@ class LivePhotoUnlockHook : XposedModule() {
         } catch (_: Throwable) {}
 
         // ----- 直通 Remux 转码：跳过软/硬编直接复制目标文件（解决聊天与朋友圈转码卡死/降级/发表失败） -----
+        // 8.0.77: yt4.b0.Vi/Ui -> re0.e；Play 8.0.72: np4.b0.mh/vh -> ad0.e
         try {
-            val remuxCls = Class.forName("yt4.b0", false, loader)
+            val remuxCls = arrayOf("yt4.b0", "np4.b0").firstNotNullOfOrNull { n ->
+                try { Class.forName(n, false, loader) } catch (_: Throwable) { null }
+            } ?: throw ClassNotFoundException("no remux class (yt4.b0/np4.b0)")
             for (m in remuxCls.methods) {
-                // 1. 聊天 C2C 实况转码直通 (Vi: 5 参数)
-                if (m.name == "Vi" && m.parameterTypes.size == 5) {
+                // 1. 聊天 C2C 实况转码直通 (8.0.77 Vi 5 参 / Play mh 4 参，前 3 参均为 src,dst,thumb)
+                if ((m.name == "Vi" && m.parameterTypes.size == 5) ||
+                    (m.name == "mh" && m.parameterTypes.size == 4)) {
                     hook(m)
                         .setPriority(PRIORITY_HIGHEST)
                         .intercept { chain ->
@@ -273,24 +303,13 @@ class LivePhotoUnlockHook : XposedModule() {
                                 }
                             }
                             ensureThumbFile(srcPath, thumbPath)
-                            try {
-                                val resCls = Class.forName("re0.e", false, loader)
-                                val ctor = resCls.getDeclaredConstructor(
-                                    Boolean::class.javaPrimitiveType,
-                                    Int::class.javaPrimitiveType
-                                )
-                                ctor.isAccessible = true
-                                ctor.newInstance(copyOk, 0)
-                            } catch (t: Throwable) {
-                                log(Log.WARN, TAG, "re0.e construct failed, fallback proceed", t)
-                                chain.proceed()
-                            }
+                            newRemuxResult(loader, copyOk) ?: chain.proceed()
                         }
-                    log(Log.INFO, TAG, "yt4.b0.Vi (chat remux) bypass hooked")
+                    log(Log.INFO, TAG, "${remuxCls.name}.${m.name} (chat remux) bypass hooked")
                 }
 
-                // 2. 朋友圈 SNS 实况转码直通 (Ui: 2 参数 RecordConfigProvider, Continuation)
-                if (m.name == "Ui" && m.parameterTypes.size == 2) {
+                // 2. 朋友圈 SNS 实况转码直通 (8.0.77 Ui / Play vh，均 2 参 RecordConfigProvider + Continuation)
+                if ((m.name == "Ui" || m.name == "vh") && m.parameterTypes.size == 2) {
                     hook(m)
                         .setPriority(PRIORITY_HIGHEST)
                         .intercept { chain ->
@@ -328,20 +347,9 @@ class LivePhotoUnlockHook : XposedModule() {
                                 }
                             }
                             ensureThumbFile(srcPath, thumbPath)
-                            try {
-                                val resCls = Class.forName("re0.e", false, loader)
-                                val ctor = resCls.getDeclaredConstructor(
-                                    Boolean::class.javaPrimitiveType,
-                                    Int::class.javaPrimitiveType
-                                )
-                                ctor.isAccessible = true
-                                ctor.newInstance(copyOk, 0)
-                            } catch (t: Throwable) {
-                                log(Log.WARN, TAG, "re0.e construct failed, fallback proceed", t)
-                                chain.proceed()
-                            }
+                            newRemuxResult(loader, copyOk) ?: chain.proceed()
                         }
-                    log(Log.INFO, TAG, "yt4.b0.Ui (sns remux) bypass hooked")
+                    log(Log.INFO, TAG, "${remuxCls.name}.${m.name} (sns remux) bypass hooked")
                 }
             }
         } catch (t: Throwable) {
@@ -573,6 +581,21 @@ class LivePhotoUnlockHook : XposedModule() {
 
     /** videoFilePath -> 源图片路径（提取时记录，供导出与转码阶段回查） */
     private val sVideoSource = HashMap<String, String>()
+
+    /** 构造 remux 结果对象：8.0.77 re0.e(ZI) / Play 8.0.72 ad0.e(ZI) */
+    private fun newRemuxResult(loader: ClassLoader, ok: Boolean): Any? {
+        for (n in arrayOf("re0.e", "ad0.e")) {
+            try {
+                val ctor = Class.forName(n, false, loader).getDeclaredConstructor(
+                    Boolean::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType
+                )
+                ctor.isAccessible = true
+                return ctor.newInstance(ok, 0)
+            } catch (_: Throwable) {}
+        }
+        return null
+    }
 
     /** 确保转码产物的封面缩略图存在（若不存在则从源图生成/复制，满足微信 UploadManager 的存在性校验） */
     private fun ensureThumbFile(srcVideoPath: String, thumbPath: String) {
@@ -1008,8 +1031,10 @@ class LivePhotoUnlockHook : XposedModule() {
     companion object {
         private const val TAG = "LivePhotoUnlock"
         private const val PKG_WECHAT = "com.tencent.mm"
-        private const val CLS_MM_LIVE_PHOTO = "wp.b"
         private const val CLS_CORE = "com.motion.core.LivePhotoCore"
+
+        /** 实况包装类候选名（多版本混淆映射：8.0.77=wp.b / 8.0.76=qp.b / Play 8.0.72=fq.b） */
+        private val WRAPPER_CANDIDATES = arrayOf("wp.b", "qp.b", "fq.b")
 
         private const val SP_TINKER_SHARE = "tinker_patch_share_config"
         private const val KEY_BOOTS_INSTALL = "tinker-boots-install-info"

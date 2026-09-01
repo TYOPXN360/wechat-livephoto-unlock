@@ -1,5 +1,21 @@
 # Changelog
 
+## v2.8.0 (2026-09-02)
+
+**适配 Google Play 版微信 8.0.72，多版本混淆类名自适应。**
+
+### 核心突破与修复
+1. **多版本包装类自适应 (`findLivePhotoWrapper`)**：
+   - Play 版 8.0.72 的实况包装类为 `fq.b`（国内 8.0.77 为 `wp.b`），硬编码类名导致 Play 版模块完全不生效
+   - 按「字段 `b` 类型 == `com.motion.core.LivePhotoCore`」特征自动在候选类（`wp.b` / `qp.b` / `fq.b`）中定位包装类，不再依赖固定类名
+2. **Remux 直通多版本适配 (`np4.b0`)**：
+   - Play 版聊天/朋友圈转码入口为 `np4.b0.mh` / `np4.b0.vh`（国内 8.0.77 为 `yt4.b0.Vi` / `Ui`），结果类为 `ad0.e(ZI)`（国内为 `re0.e`）
+   - 此前 Play 版上 remux 旁路注册失败（`ClassNotFoundException: yt4.b0`），发送实况会复发软编卡死；现按候选类自动挂载，Play 版全链路与国内版行为一致
+3. **Play 版验证**：
+   - Play 8.0.72(3085) 全部 9 组钩子注册成功，`fq.b` 强制成功、核心实例注入、remux 直通均正常工作
+
+---
+
 ## v2.7.0 (2026-08-29)
 
 **支持朋友圈实况转码直通与 Android 17 跨进程 Intent 脱敏。**
