@@ -12,8 +12,8 @@ android {
         applicationId = "me.livephoto.assist"
         minSdk = 26
         targetSdk = 36
-        versionCode = 28
-        versionName = "2.8.0"
+        versionCode = 29
+        versionName = "2.9.0"
     }
 
     signingConfigs {
@@ -59,4 +59,6 @@ kotlin {
 
 dependencies {
     compileOnly(libs.libxposed.api)
+    testImplementation(kotlin("test"))
+    testImplementation("junit:junit:4.13.2")
 }

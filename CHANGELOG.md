@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.9.0 (2026-09-04)
+
+**多版本自适应升级为结构探测 + 适配微信 8.0.78 + 修复无补丁环境查看门控。**
+
+### 核心突破与修复
+1. **方法签名结构探测 (`DexProbe`)**：
+   - 微信每次升级混淆类名全部改变，此前「类名候选名单」式自适应在 8.0.78 上再次失效
+   - 内置轻量 dex 方法表解析器（只读 string/type/proto/method 四张表），按结构特征定位：
+     - remux worker = 同类同时声明「三 String 挂起方法」+「RecordConfigProvider 挂起方法」（8.0.77 `yt4.b0` / Play `np4.b0` / 8.0.78 `ox4.b0`）
+     - remux 结果类 = worker 同 dex 内 `(ZI)` 构造器类（`re0.e` / `ad0.e` / `nf0.e`）
+     - 实况包装类 = 持有 `LivePhotoCore` 类型字段的类（类名名单仍作快路径）
+   - JVM 单测用 8.0.77 / Play 8.0.72 / 8.0.78 三个真实 APK 做回归
+2. **适配微信 8.0.78（原生无补丁环境）**：
+   - 查看门控更换为 `mq5.f.a()` = `sj(RepairerConfigC2CLiveImagePreview, true) == 1 && wp.b.e`
+   - 该 config 默认值带**设备指纹白名单**（非白名单机型写 MMKV 恒被默认值 0 覆盖）→ 此前「发送正常但点开照片没有实况按钮」
+   - 修复：hook 稳定未混淆类 `RepairerConfigC2CLiveImagePreview.c() -> 1`（根因）+ 门控 `mq5.f.a() / nm5.f.a() -> true`（兜底）
+3. **三版真机验证**：
+   - Pixel 9 Pro XL（Android 17，8.0.78 无补丁）：全部钩子注册，查看实况按钮恢复
+   - Redmi（Android 16，Play 8.0.72）：`dex-probe remux: np4.b0.mh/vh -> ad0.e`，无回退
+   - 8.0.77 有补丁环境照常工作
+
+---
+
 ## v2.8.0 (2026-09-02)
 
 **适配 Google Play 版微信 8.0.72，多版本混淆类名自适应。**

@@ -96,26 +96,23 @@ class LivePhotoUnlockHook : XposedModule() {
         }
     }
 
-    /** 多版本自适应：在 classloader 上按特征扫描实况包装类（内含 LivePhotoCore 静态字段 b） */
+    /** 多版本自适应：名单快路径 → dex 结构探测兜底（内含 LivePhotoCore 类型字段的类） */
     private fun findLivePhotoWrapper(loader: ClassLoader): Class<*>? {
-        // 已知混淆名候选（8.0.77 / 8.0.76 / Play 8.0.72 / 其他灰度版本）
         for (name in WRAPPER_CANDIDATES) {
             try {
                 val cls = Class.forName(name, false, loader)
                 if (findCoreField(cls) != null) return cls
             } catch (_: Throwable) {}
         }
-        // 兜底：扫描常见 dex 包前缀下的 b/c/d 短名类
-        return null
+        // 兜底：扫 APK field_ids，找「持有 LivePhotoCore 类型字段的类」
+        val probed = runCatching { DexProbe.findWrapper(appApkPath()) }.getOrNull() ?: return null
+        return try { Class.forName(probed, false, loader) } catch (_: Throwable) { null }
     }
 
-    /** 找到 LivePhotoCore 类型的静态字段（特征：b 字段类型为 com.motion.core.LivePhotoCore） */
+    /** 找到 LivePhotoCore 类型的字段（类型匹配，不依赖字段名） */
     private fun findCoreField(wrapper: Class<*>): java.lang.reflect.Field? {
-        return try {
-            wrapper.getDeclaredField("b").takeIf { it.type.name == CLS_CORE }
-        } catch (_: Throwable) {
-            null
-        }
+        return runCatching { wrapper.getDeclaredField("b") }.getOrNull()?.takeIf { it.type.name == CLS_CORE }
+            ?: wrapper.declaredFields.firstOrNull { it.type.name == CLS_CORE }
     }
 
     /** 在补丁已加载的最终 classloader 上注册所有 hook */
@@ -248,13 +245,30 @@ class LivePhotoUnlockHook : XposedModule() {
         } catch (_: Throwable) {}
 
         // ----- 强制聊天实况门控（已验证对聊天查看有效） -----
+        // 根因：8.0.78 门控 mq5.f.a() = sj(RepairerConfigC2CLiveImagePreview,true)==1 && wp.b.e，
+        // 而该 config 的默认值 c() 带设备指纹白名单（非白名单恒 0），写 MMKV 无效。
+        // 修法：config 类名三版稳定未混淆（repairer 反射注册依赖），直接 hook 其默认值 c() -> 1；
+        // 再 hook 门控方法 a()（8.0.77 nm5.f / 8.0.78 mq5.f，名字各异，hook 失败不影响 c() 方案）。
         try {
-            val nm5f = Class.forName("nm5.f", false, loader)
-            val aMethod = nm5f.getDeclaredMethod("a")
-            hook(aMethod)
-                .setPriority(PRIORITY_HIGHEST)
-                .intercept { _ -> true }
-        } catch (_: Throwable) {}
+            runCatching {
+                val cfg = Class.forName("com.tencent.mm.repairer.config.chatting.RepairerConfigC2CLiveImagePreview", false, loader)
+                val c = cfg.declaredMethods.firstOrNull {
+                    it.name == "c" && it.parameterTypes.isEmpty() && it.returnType == Any::class.java
+                } ?: error("c() not found")
+                hook(c).setPriority(PRIORITY_HIGHEST).intercept { _ -> 1 }
+                log(Log.INFO, TAG, "preview config default forced: ${cfg.simpleName}.c() -> 1")
+            }.onFailure { log(Log.WARN, TAG, "preview config hook failed", it) }
+            // 门控方法 a() 兜底（类名随版本变，找到哪个算哪个）
+            for (gateName in arrayOf("nm5.f", "mq5.f")) {
+                runCatching {
+                    val g = Class.forName(gateName, false, loader)
+                    hook(g.getDeclaredMethod("a")).setPriority(PRIORITY_HIGHEST).intercept { _ -> true }
+                    log(Log.INFO, TAG, "preview gate: $gateName.a() -> true")
+                }
+            }
+        } catch (t: Throwable) {
+            log(Log.WARN, TAG, "preview gate hook failed", t)
+        }
 
         // ----- 设备 HEVC 硬件编码能力放行（让 Pixel 走硬件编码器，不卡软编） -----
         try {
@@ -270,15 +284,19 @@ class LivePhotoUnlockHook : XposedModule() {
         } catch (_: Throwable) {}
 
         // ----- 直通 Remux 转码：跳过软/硬编直接复制目标文件（解决聊天与朋友圈转码卡死/降级/发表失败） -----
-        // 8.0.77: yt4.b0.Vi/Ui -> re0.e；Play 8.0.72: np4.b0.mh/vh -> ad0.e
+        // 结构探测：同类含「三 String 挂起」+「RecordConfigProvider 挂起」= remux worker（三版验证）
         try {
-            val remuxCls = arrayOf("yt4.b0", "np4.b0").firstNotNullOfOrNull { n ->
-                try { Class.forName(n, false, loader) } catch (_: Throwable) { null }
-            } ?: throw ClassNotFoundException("no remux class (yt4.b0/np4.b0)")
+            val probed = DexProbe.findRemux(appApkPath())
+            val remuxCls = probed?.let { p ->
+                runCatching { Class.forName(p.worker, false, loader) }.getOrNull().also {
+                    if (it != null) log(Log.INFO, TAG, "dex-probe remux: ${p.worker}.${p.chat}/${p.sns} -> ${p.result}")
+                }
+            } ?: throw ClassNotFoundException("no remux class (dex-probe failed)")
             for (m in remuxCls.methods) {
-                // 1. 聊天 C2C 实况转码直通 (8.0.77 Vi 5 参 / Play mh 4 参，前 3 参均为 src,dst,thumb)
-                if ((m.name == "Vi" && m.parameterTypes.size == 5) ||
-                    (m.name == "mh" && m.parameterTypes.size == 4)) {
+                // 1. 聊天 C2C 实况转码直通（签名特征：3+ 参且前 3 参均为 String；src,dst,thumb）
+                if (m.name == probed?.chat || (probed == null && m.parameterTypes.size >= 4 &&
+                            m.parameterTypes[0] == String::class.java && m.parameterTypes[1] == String::class.java &&
+                            m.parameterTypes[2] == String::class.java && m.name.length <= 2)) {
                     hook(m)
                         .setPriority(PRIORITY_HIGHEST)
                         .intercept { chain ->
@@ -308,8 +326,8 @@ class LivePhotoUnlockHook : XposedModule() {
                     log(Log.INFO, TAG, "${remuxCls.name}.${m.name} (chat remux) bypass hooked")
                 }
 
-                // 2. 朋友圈 SNS 实况转码直通 (8.0.77 Ui / Play vh，均 2 参 RecordConfigProvider + Continuation)
-                if ((m.name == "Ui" || m.name == "vh") && m.parameterTypes.size == 2) {
+                // 2. 朋友圈 SNS 实况转码直通（签名特征：2 参 RecordConfigProvider + Continuation）
+                if (m.parameterTypes.size == 2 && m.parameterTypes[0].name == "com.tencent.mm.plugin.recordvideo.jumper.RecordConfigProvider") {
                     hook(m)
                         .setPriority(PRIORITY_HIGHEST)
                         .intercept { chain ->
@@ -455,7 +473,7 @@ class LivePhotoUnlockHook : XposedModule() {
         return try {
             val core = Class.forName(CLS_CORE, false, loader)
                 .getDeclaredConstructor().newInstance()
-            val f = wpb.getDeclaredField("b")
+            val f = findCoreField(wpb) ?: return false
             f.isAccessible = true
             f.set(null, core)
             true
@@ -465,14 +483,17 @@ class LivePhotoUnlockHook : XposedModule() {
         }
     }
 
-    private fun setStaticBool(wpb: Class<*>, name: String, value: Boolean): Boolean {
+    /** 静态布尔字段按类型找（wrapper 的「是否支持」开关），不依赖字段名 */
+    private fun setStaticBool(wpb: Class<*>, @Suppress("UNUSED_PARAMETER") name: String, value: Boolean): Boolean {
         return try {
-            val f = wpb.getDeclaredField(name)
+            val f = wpb.declaredFields.firstOrNull {
+                java.lang.reflect.Modifier.isStatic(it.modifiers) && it.type == Boolean::class.javaPrimitiveType
+            } ?: return false
             f.isAccessible = true
             f.setBoolean(null, value)
             true
         } catch (t: Throwable) {
-            log(Log.ERROR, TAG, "setStaticBool($name) failed", t)
+            log(Log.ERROR, TAG, "setStaticBool failed", t)
             false
         }
     }
@@ -582,9 +603,14 @@ class LivePhotoUnlockHook : XposedModule() {
     /** videoFilePath -> 源图片路径（提取时记录，供导出与转码阶段回查） */
     private val sVideoSource = HashMap<String, String>()
 
-    /** 构造 remux 结果对象：8.0.77 re0.e(ZI) / Play 8.0.72 ad0.e(ZI) */
+    /** 构造 remux 结果对象（(ZI) 构造器）：优先用 dex 探测到的结果类，回退已知名单 */
     private fun newRemuxResult(loader: ClassLoader, ok: Boolean): Any? {
-        for (n in arrayOf("re0.e", "ad0.e")) {
+        val names = arrayOfNulls<String>(3).also {
+            it[0] = runCatching { DexProbe.findRemux(appApkPath())?.result }.getOrNull()
+            it[1] = "re0.e"; it[2] = "ad0.e"
+        }
+        for (n in names) {
+            if (n.isNullOrEmpty()) continue
             try {
                 val ctor = Class.forName(n, false, loader).getDeclaredConstructor(
                     Boolean::class.javaPrimitiveType,
@@ -596,6 +622,9 @@ class LivePhotoUnlockHook : XposedModule() {
         }
         return null
     }
+
+    /** 微信 APK 路径（供 DexProbe 扫描；探测失败不影响主流程） */
+    private fun appApkPath(): String = sAppContext?.applicationInfo?.sourceDir ?: ""
 
     /** 确保转码产物的封面缩略图存在（若不存在则从源图生成/复制，满足微信 UploadManager 的存在性校验） */
     private fun ensureThumbFile(srcVideoPath: String, thumbPath: String) {

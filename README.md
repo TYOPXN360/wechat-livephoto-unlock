@@ -27,8 +27,16 @@
 | `getVideoMetaData(id, savePath)` | 提取内嵌 MP4 写入 savePath，返回 `{errorCode, videoPath, videoSize, videoDuration, videoWidth, videoHeight}`（mvhd/tkhd 解析） | 预览与发送所需的视频数据及尺寸 |
 | `exportLivePhoto(String json)` | 按 MMLivePhotoExportData JSON 输出动态 JPEG（图+视频拼接）+ 封面 | 保存到相册 |
 | `wp/b.b` 校验出口 | 强制放行成功标志 `t0.a = true` | 绕过 Pixel 照片 4:3 与内嵌视频 16:9 的 **宽高比（Ratio Error）严苛拦截** |
-| `yt4/b0.Vi` Remuxer | 直接透传文件至 VFS 目标，跳过重编码 | 消除非白名单机型走软编导致的**转码死锁/数分钟超时降级**（4ms 秒发） |
-| `nm5.f.a()` | 强制返回 true | 恢复补丁环境下的**聊天界面实况按钮与播放能力** |
+| `Remux worker`（`yt4.b0.Vi` / `np4.b0.mh` / `ox4.b0.dj` 等各版本入口） | 直接透传文件至 VFS 目标，跳过重编码 | 消除非白名单机型走软编导致的**转码死锁/数分钟超时降级**（4ms 秒发） |
+| 聊天实况门控（`nm5.f.a()` / `mq5.f.a()` + `RepairerConfigC2CLiveImagePreview.c()`） | 强制返回 true / 1 | 恢复**聊天界面实况按钮与播放能力**（含 8.0.78 设备指纹白名单绕过） |
+
+**多版本自适应（v2.9.0 起）**：微信每次升级都会重新混淆，模块不再依赖固定类名——启动时用内置 dex 方法表解析器按**方法签名结构**在 APK 内探测关键类：
+
+- remux worker：同类同时声明「三 String 挂起方法」+「RecordConfigProvider 挂起方法」
+- remux 结果类：worker 同 dex 内的 `(ZI)` 构造器类
+- 实况包装类：持有 `LivePhotoCore` 类型字段的类（快路径仍走类名名单）
+
+已实测 8.0.77 / Play 8.0.72 / 8.0.78，JVM 单测用三个真实 APK 回归。
 
 配置门控写入带**持久收敛机制**：
 
@@ -50,7 +58,7 @@
 | 接收查看朋友圈实况 | ✅ |
 | 保存到相册（带 LIVE 标记） | ✅ |
 
-测试环境：小米机型（Android 16）、Google Pixel 9 Pro XL（Android 17 / 有热补丁环境），微信 8.0.7x。
+测试环境：Redmi K30 Pro（Android 16 / Play 8.0.72 小号观察中）、Google Pixel 9 Pro XL（Android 17 / 8.0.78 无补丁 主号），另回归 8.0.77 有补丁环境。
 
 ## 构建
 
@@ -71,7 +79,7 @@
 
 ## 注意事项
 
-- 微信版本升级后混淆类名可能变化 → hook 静默降级，不影响微信正常运行（当前适配 `wp.b`（8.0.77）与 `fq.b`（Play 8.0.72）两套命名体系，Remux 直通同步适配 `yt4.b0` / `np4.b0`）
+- 微信版本升级后混淆类名会变化 → 模块按**方法签名结构**在 APK 内自动探测关键类（remux worker / 包装类 / 结果类），不依赖固定类名；已实测 8.0.77、Play 8.0.72、8.0.78
 - 未安装模块的接收方如果其微信没有实况能力，看到的将是静态图片（与普通不支持机型的表现一致）；白名单真机用户收到的可正常查看
 - 长按相册中的实况条目会复制一段内部状态字符串——这是微信官方自带的灰度调试功能，无害
 - 日志标签：LSPosed 日志中过滤 `LivePhotoUnlock` 可观察各环节执行情况
