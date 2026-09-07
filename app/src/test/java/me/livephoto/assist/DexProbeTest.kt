@@ -44,4 +44,13 @@ class DexProbeTest {
         assertEquals("fq.b", DexProbe.findWrapper("$ws/work/play8072/base.apk"))
         assertEquals("wp.b", DexProbe.findWrapper("$ws/work/weixin8078android3160_arm64.apk"))
     }
+
+    @Test fun `e12 hotfix build keeps structure`() {
+        val e12 = DexProbe.findRemux("$ws/work/weixin8078_0x28004e12_arm64.apk")!!
+        assertEquals("ox4.b0", e12.worker)
+        assertEquals("dj", e12.chat)
+        assertEquals("cj", e12.sns)
+        assertEquals("nf0.e", e12.result)
+        assertEquals("wp.b", DexProbe.findWrapper("$ws/work/weixin8078_0x28004e12_arm64.apk"))
+    }
 }
