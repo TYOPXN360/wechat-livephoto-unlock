@@ -12,8 +12,8 @@ android {
         applicationId = "me.livephoto.assist"
         minSdk = 26
         targetSdk = 36
-        versionCode = 31
-        versionName = "2.10.1"
+        versionCode = 32
+        versionName = "2.11.0"
     }
 
     signingConfigs {
