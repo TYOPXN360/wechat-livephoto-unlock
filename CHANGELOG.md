@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.10.1 (2026-09-13)
+
+**修复 3141 预览根因 hook 漏挂 + 堆栈可读。**
+
+1. **预览 `c()` 查找不再卡返回类型**：3141 的 `c()` 返回 `Integer` 而非 `Object`，旧过滤 `returnType == Any` 在 3141 上 `c() not found` 漏挂（靠 `nm5.f.a()->true` 兜底顶着）。改为无参名 `c` 即唯一，3141/3180 通吃。
+2. **R8 保留行号**：`proguard-rules.pro` 加 `-keepattributes SourceFile,LineNumberTable`，排错堆栈不再是 `r8-map-id` 天书。
+
+---
+
 ## v2.10.0 (2026-09-13)
 
 **适配微信 8.0.78 build 3180 + 兼容 8.0.77 split 包（3141）。**

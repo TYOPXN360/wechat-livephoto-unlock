@@ -252,8 +252,9 @@ class LivePhotoUnlockHook : XposedModule() {
         try {
             runCatching {
                 val cfg = Class.forName("com.tencent.mm.repairer.config.chatting.RepairerConfigC2CLiveImagePreview", false, loader)
+                // ponytail: 不卡返回类型——3141 的 c() 返回 Integer 而非 Object，卡死就会漏 hook；无参名 c 即唯一。
                 val c = cfg.declaredMethods.firstOrNull {
-                    it.name == "c" && it.parameterTypes.isEmpty() && it.returnType == Any::class.java
+                    it.name == "c" && it.parameterTypes.isEmpty()
                 } ?: error("c() not found")
                 hook(c).setPriority(PRIORITY_HIGHEST).intercept { _ -> 1 }
                 log(Log.INFO, TAG, "preview config default forced: ${cfg.simpleName}.c() -> 1")
