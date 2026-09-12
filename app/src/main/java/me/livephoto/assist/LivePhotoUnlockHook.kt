@@ -266,7 +266,7 @@ class LivePhotoUnlockHook : XposedModule() {
                     hook(gate.getDeclaredMethod("a")).setPriority(PRIORITY_HIGHEST).intercept { _ -> true }
                     log(Log.INFO, TAG, "preview gate: ${gate.name}.a() -> true")
                 }.onFailure { log(Log.WARN, TAG, "preview gate a() hook failed on ${gate.name}", it) }
-                // b(msg)：只在原方法返回 false（不可播）时才放行 true，避免误伤过期清理逻辑
+                // b(msg)：返回 true=已过期不可播；只把过期放行为未过期（true->false），未过期保持 false 让 K() 继续验 XML
                 runCatching {
                     val bmp = gate.declaredMethods.firstOrNull { m ->
                         m.name == "b" && m.parameterTypes.size == 1 &&
@@ -274,10 +274,46 @@ class LivePhotoUnlockHook : XposedModule() {
                             m.returnType == Boolean::class.javaPrimitiveType
                     } ?: error("b(msg) not found on ${gate.name}")
                     hook(bmp).setPriority(PRIORITY_HIGHEST).intercept { chain ->
-                        (chain.proceed() as? Boolean)?.let { if (!it) true else it } ?: true
+                        val msg = chain.getArgs().firstOrNull()
+                        val orig = (chain.proceed() as? Boolean) ?: false
+                        val out = if (orig) false else orig
+                        // ponytail: 只打 true->false 那条，正常 false 不刷屏。
+                        if (orig) {
+                            val id = runCatching {
+                                msg!!.javaClass.getMethod("getMsgId").invoke(msg)
+                            }.getOrNull()
+                            log(Log.INFO, TAG, "preview gate: ${gate.name}.b(msgId=$id) $orig->$out")
+                        }
+                        out
                     }
-                    log(Log.INFO, TAG, "preview gate: ${gate.name}.b(msg) miss->true")
+                    log(Log.INFO, TAG, "preview gate: ${gate.name}.b(msg) expired->false")
                 }.onFailure { log(Log.WARN, TAG, "preview gate b(msg) hook skipped", it) }
+                // K() 最终判定 iu.l1.b(xml, isSend)：消息 XML 无实况附件即 false。
+                // 若门控全放行仍无按钮，说明消息体本身没带实况数据——打一条区分责任。
+                runCatching {
+                    val l1 = Class.forName("iu.l1", false, loader)
+                    val b = l1.declaredMethods.firstOrNull { m ->
+                        m.name == "b" && m.parameterTypes.size == 2 &&
+                            m.returnType == Boolean::class.javaPrimitiveType
+                    } ?: error("iu.l1.b not found")
+                    hook(b).setPriority(PRIORITY_HIGHEST).intercept { chain ->
+                        val r = (chain.proceed() as? Boolean) ?: false
+                        if (!r) log(Log.INFO, TAG, "preview gate: iu.l1.b(xml)->false (msg has no live attach?)")
+                        r
+                    }
+                    log(Log.INFO, TAG, "preview gate: iu.l1.b(xml) traced")
+                }.onFailure { log(Log.WARN, TAG, "iu.l1 trace skipped", it) }
+                // q1.B 静态总开关：画廊构造时 B = gate.a() 赋值一次；若构造时序早于 hook 就恒 false。
+                // 直接置 true，不等构造赋值（ponytail：字段名 B 单字母，混淆后稳定因为是 q1 内唯一 static boolean？否——按类型+static 找，找不到就跳过）。
+                runCatching {
+                    val q1 = Class.forName("com.tencent.mm.ui.chatting.gallery.q1", false, loader)
+                    val f = q1.declaredFields.firstOrNull {
+                        java.lang.reflect.Modifier.isStatic(it.modifiers) && it.type == Boolean::class.javaPrimitiveType
+                    } ?: error("q1 static boolean not found")
+                    f.isAccessible = true
+                    f.setBoolean(null, true)
+                    log(Log.INFO, TAG, "preview gate: q1.${f.name}=true (static B)")
+                }.onFailure { log(Log.WARN, TAG, "q1.B force skipped", it) }
             } else {
                 for (gateName in arrayOf("nm5.f", "mq5.f", "lo5.f")) {
                     runCatching {
