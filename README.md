@@ -28,7 +28,7 @@
 | `exportLivePhoto(String json)` | 按 MMLivePhotoExportData JSON 输出动态 JPEG（图+视频拼接）+ 封面 | 保存到相册 |
 | `wp/b.b` 校验出口 | 强制放行成功标志 `t0.a = true` | 绕过 Pixel 照片 4:3 与内嵌视频 16:9 的 **宽高比（Ratio Error）严苛拦截** |
 | `Remux worker`（`yt4.b0.Vi` / `np4.b0.mh` / `ox4.b0.dj` 等各版本入口） | 直接透传文件至 VFS 目标，跳过重编码 | 消除非白名单机型走软编导致的**转码死锁/数分钟超时降级**（4ms 秒发） |
-| 聊天实况门控（`nm5.f.a()` / `mq5.f.a()` + `RepairerConfigC2CLiveImagePreview.c()`） | 强制返回 true / 1 | 恢复**聊天界面实况按钮与播放能力**（含 8.0.78 设备指纹白名单绕过） |
+| 聊天实况门控（结构探测：`lo5.f` / `mq5.f` 的 `a()` + `b(msg)` + `RepairerConfigC2CLiveImagePreview.c()`） | `a()` 强制 true；`b(msg)` 仅原 false 时放行；`c()` 强制 1 | 恢复**聊天界面实况按钮与播放能力**（含 8.0.78 设备指纹白名单绕过；3141 的 `nm5.f` 只是对话框类，不 hook） |
 | 共享设备断言（3180 新增 `ss.v.c()`） | 强制返回 true | 恢复**朋友圈发表门控与相机导出链路**（旧版无此方法自动跳过） |
 
 **多版本自适应（v2.9.0 起，v2.10.0 扩展验证）**：微信每次升级都会重新混淆，模块不再依赖固定类名——启动时用内置 dex 方法表解析器按**方法签名结构**在 APK 内探测关键类：
@@ -36,6 +36,7 @@
 - remux worker：同类同时声明「三 String 挂起方法」+「RecordConfigProvider 挂起方法」
 - remux 结果类：worker 同 dex 内的 `(ZI)` 构造器类
 - 实况包装类：持有 `LivePhotoCore` 类型字段的类（快路径仍走类名名单）
+- 聊天查看门控：同类同时声明 `a()Z` + `b(msg: e9)Z`（3141=`lo5.f` / 3180=`mq5.f`）
 
 已实测 8.0.77 单包 3160 / 8.0.77 split 包 3141（`tv4.b0.dj/cj → hg0.e`，`vq.b`）/ Play 8.0.72 / 8.0.78 3160 / e12 / 3180，JVM 单测用真实 APK 回归。
 
