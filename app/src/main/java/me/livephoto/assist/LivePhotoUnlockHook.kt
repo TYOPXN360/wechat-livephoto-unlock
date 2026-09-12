@@ -270,6 +270,15 @@ class LivePhotoUnlockHook : XposedModule() {
             log(Log.WARN, TAG, "preview gate hook failed", t)
         }
 
+        // ----- 3180 共享设备断言（根因：mq5/bk4/jw3/og3 等 4+ 处由直读 wp.b.e 改为 ss/v.c()，hook 一处全通；旧版无此方法则跳过） -----
+        // ponytail: 只 hook 无参 c()Z；若以后新增重载/改名，改签名扫描再加。
+        runCatching {
+            val v = Class.forName("ss.v", false, loader)
+            val c = v.getDeclaredMethod("c")
+            hook(c).setPriority(PRIORITY_HIGHEST).intercept { _ -> true }
+            log(Log.INFO, TAG, "os-support gate: ss.v.c() -> true")
+        }.onFailure { log(Log.WARN, TAG, "ss.v.c hook skipped (pre-3180?)", it) }
+
         // ----- 设备 HEVC 硬件编码能力放行（让 Pixel 走硬件编码器，不卡软编） -----
         try {
             val checkerCls = Class.forName("px3.n", false, loader)

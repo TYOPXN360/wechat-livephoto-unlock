@@ -53,4 +53,13 @@ class DexProbeTest {
         assertEquals("nf0.e", e12.result)
         assertEquals("wp.b", DexProbe.findWrapper("$ws/work/weixin8078_0x28004e12_arm64.apk"))
     }
+
+    @Test fun `8_0_78_3180 keeps ox4b0`() {
+        val r = DexProbe.findRemux("$ws/work/weixin8078android3180_0x28004e32_arm64.apk")!!
+        assertEquals("ox4.b0", r.worker)
+        assertEquals("dj", r.chat)
+        assertEquals("cj", r.sns)
+        assertEquals("nf0.e", r.result)
+        assertEquals("wp.b", DexProbe.findWrapper("$ws/work/weixin8078android3180_0x28004e32_arm64.apk"))
+    }
 }
