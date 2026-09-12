@@ -48,6 +48,23 @@ internal object DexProbe {
         return null
     }
 
+    /**
+     * 结构探测聊天查看门控：同类同时声明 `a()Z`（总开关）+ `b(e9)msg -> Z`（单条消息）。
+     * 3141=lo5.f / 3180=mq5.f（类名漂移，结构稳定）。返回 dotted 类名，找不到返回 null。
+     * 纯 dex 扫描；调用方再用最终 classloader 反射（ponytail：不缓存，进来就是新进程）。
+     */
+    fun findViewGate(apkPath: String): String? {
+        ZipFile(apkPath).use { zip ->
+            for (e in zip.entries()) {
+                val n = e.name
+                if (!n.startsWith("classes") || !n.endsWith(".dex")) continue
+                val bytes = zip.getInputStream(e).use { it.readBytes() }
+                findViewGateInDex(bytes)?.let { return it }
+            }
+        }
+        return null
+    }
+
     // ---------- 最小 dex 解析：string/type/proto/method 四张表 ----------
 
     private class Reader(val b: ByteArray) {
@@ -130,6 +147,44 @@ internal object DexProbe {
         }
         val result = (zi.firstOrNull { it.endsWith("/e;") } ?: zi.firstOrNull() ?: "").drop(1).dropLast(1).replace('/', '.')
         return Remux(cls.drop(1).dropLast(1).replace('/', '.'), s.chat!!, s.sns!!, result)
+    }
+
+    private const val MSG = "Lcom/tencent/mm/storage/e9;"
+
+    /** 在单个 dex 中找「a()Z + b(e9)Z 同类」= 聊天查看门控（3141=lo5.f / 3180=mq5.f） */
+    internal fun findViewGateInDex(b: ByteArray): String? {
+        if (b.size < 0x70) return null
+        val r = Reader(b)
+        val strSize = r.u4(0x38); val strOff = r.u4(0x3c)
+        val typeSize = r.u4(0x40); val typeOff = r.u4(0x44)
+        val protoSize = r.u4(0x48); val protoOff = r.u4(0x4c)
+        val methodSize = r.u4(0x58); val methodOff = r.u4(0x5c)
+        if (strSize <= 0 || strSize > 5_000_000 || typeSize > 1_000_000 || protoSize > 1_000_000 || methodSize > 5_000_000) return null
+        val strData = IntArray(strSize) { k -> r.u4(strOff + 4 * k) }
+        val types = Array(typeSize) { k -> r.mutf8(r.u4(typeOff + 4 * k), strData) }
+        val protoParams = Array(protoSize) { k ->
+            val listOff = r.u4(protoOff + 12 * k + 8)
+            if (listOff == 0) emptyList()
+            else List(r.u4(listOff)) { j -> types[r.u2(listOff + 4 + 2 * j)] }
+        }
+        val protoRet = Array(protoSize) { k -> types[r.u4(protoOff + 12 * k + 4)] }
+        val hasA = HashSet<String>(); val hasB = HashSet<String>()
+        for (k in 0 until methodSize) {
+            val o = methodOff + 8 * k
+            val cls = types.getOrNull(r.u2(o)) ?: continue
+            if (!cls.startsWith("L") || !cls.contains('/')) continue
+            val pi = r.u2(o + 2)
+            val params = protoParams.getOrNull(pi) ?: continue
+            if (protoRet.getOrNull(pi) != "Z") continue
+            val name = r.mutf8(r.u4(o + 4), strData)
+            if (name == "a" && params.isEmpty()) hasA.add(cls)
+            if (name == "b" && params.size == 1 && params[0] == MSG) hasB.add(cls)
+        }
+        // 短名混淆类优先（门控都是两段短名），都不是则任取交集
+        val hit = hasA.intersect(hasB)
+        val pick = hit.firstOrNull { it.count { c -> c == '/' } == 1 && it.length < 10 }
+            ?: hit.firstOrNull() ?: return null
+        return pick.drop(1).dropLast(1).replace('/', '.')
     }
 
     /** 在单个 dex 中找「持有 LivePhotoCore 类型字段的类」（字段静态与否在运行时校验） */

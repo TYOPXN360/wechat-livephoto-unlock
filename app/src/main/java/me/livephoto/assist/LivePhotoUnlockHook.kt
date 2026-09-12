@@ -244,27 +244,47 @@ class LivePhotoUnlockHook : XposedModule() {
                 }
         } catch (_: Throwable) {}
 
-        // ----- 强制聊天实况门控（已验证对聊天查看有效） -----
-        // 根因：8.0.78 门控 mq5.f.a() = sj(RepairerConfigC2CLiveImagePreview,true)==1 && wp.b.e，
-        // 而该 config 的默认值 c() 带设备指纹白名单（非白名单恒 0），写 MMKV 无效。
-        // 修法：config 类名三版稳定未混淆（repairer 反射注册依赖），直接 hook 其默认值 c() -> 1；
-        // 再 hook 门控方法 a()（8.0.77 nm5.f / 8.0.78 mq5.f，名字各异，hook 失败不影响 c() 方案）。
+        // ----- 强制聊天实况查看门控（结构：a()Z 总开关 × b(msg)Z 单条消息；两处缺一不可） -----
+        // 3141 真门控 = lo5.f（a()= rj(Preview)==1 && vq.b.e；b(msg)= 伴生文件检查），nm5.f 只是对话框回调类，hook 它无效。
+        // 3180 真门控 = mq5.f（同构，类名漂移）。修法三层：Preview 默认值 -> 1（根因，白名单绕过）+
+        // 门控 a() -> true（结构扫描定位，不依赖类名）+ b(msg) 失败时放行（伴生文件缺失兜底）。
+        // ponytail: 只扫 dex 内 a()Z+b(msg)Z 同构类；若以后门控改签名，加候选再扫。
         try {
             runCatching {
                 val cfg = Class.forName("com.tencent.mm.repairer.config.chatting.RepairerConfigC2CLiveImagePreview", false, loader)
-                // ponytail: 不卡返回类型——3141 的 c() 返回 Integer 而非 Object，卡死就会漏 hook；无参名 c 即唯一。
+                // ponytail: 不卡返回类型——3141 的 c() 返回 String/走 i()，3180 返回 Object；无参名 c 即唯一。
                 val c = cfg.declaredMethods.firstOrNull {
                     it.name == "c" && it.parameterTypes.isEmpty()
                 } ?: error("c() not found")
                 hook(c).setPriority(PRIORITY_HIGHEST).intercept { _ -> 1 }
                 log(Log.INFO, TAG, "preview config default forced: ${cfg.simpleName}.c() -> 1")
             }.onFailure { log(Log.WARN, TAG, "preview config hook failed", it) }
-            // 门控方法 a() 兜底（类名随版本变，找到哪个算哪个）
-            for (gateName in arrayOf("nm5.f", "mq5.f")) {
+            // 门控 a()：先按结构找（a()Z + b(msg)Z 同类），找不到再回退旧名单
+            val gate = runCatching { DexProbe.findViewGate(appApkPath())?.let { Class.forName(it, false, loader) } }.getOrNull()
+            if (gate != null) {
                 runCatching {
-                    val g = Class.forName(gateName, false, loader)
-                    hook(g.getDeclaredMethod("a")).setPriority(PRIORITY_HIGHEST).intercept { _ -> true }
-                    log(Log.INFO, TAG, "preview gate: $gateName.a() -> true")
+                    hook(gate.getDeclaredMethod("a")).setPriority(PRIORITY_HIGHEST).intercept { _ -> true }
+                    log(Log.INFO, TAG, "preview gate: ${gate.name}.a() -> true")
+                }.onFailure { log(Log.WARN, TAG, "preview gate a() hook failed on ${gate.name}", it) }
+                // b(msg)：只在原方法返回 false（不可播）时才放行 true，避免误伤过期清理逻辑
+                runCatching {
+                    val bmp = gate.declaredMethods.firstOrNull { m ->
+                        m.name == "b" && m.parameterTypes.size == 1 &&
+                            m.parameterTypes[0].name == "com.tencent.mm.storage.e9" &&
+                            m.returnType == Boolean::class.javaPrimitiveType
+                    } ?: error("b(msg) not found on ${gate.name}")
+                    hook(bmp).setPriority(PRIORITY_HIGHEST).intercept { chain ->
+                        (chain.proceed() as? Boolean)?.let { if (!it) true else it } ?: true
+                    }
+                    log(Log.INFO, TAG, "preview gate: ${gate.name}.b(msg) miss->true")
+                }.onFailure { log(Log.WARN, TAG, "preview gate b(msg) hook skipped", it) }
+            } else {
+                for (gateName in arrayOf("nm5.f", "mq5.f", "lo5.f")) {
+                    runCatching {
+                        val g = Class.forName(gateName, false, loader)
+                        hook(g.getDeclaredMethod("a")).setPriority(PRIORITY_HIGHEST).intercept { _ -> true }
+                        log(Log.INFO, TAG, "preview gate: $gateName.a() -> true")
+                    }
                 }
             }
         } catch (t: Throwable) {

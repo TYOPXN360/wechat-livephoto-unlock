@@ -62,4 +62,19 @@ class DexProbeTest {
         assertEquals("nf0.e", r.result)
         assertEquals("wp.b", DexProbe.findWrapper("$ws/work/weixin8078android3180_0x28004e32_arm64.apk"))
     }
+
+    @Test fun `view gate lo5f on 3141 split`() {
+        // split 包 base.apk 内直读（ZipFile 套 ZipFile 不支持，解一层到内存无落盘由调用方处理；
+        // 此处 base.apk 已随 play8072  precedent 常驻 work/play8072 式目录——3141 用 apks 内联路径需先解 base）
+        // ponytail: 不在单测里解 291M apks；3141 门控已在真机验证（vq.b/nm5兜底外，lo5.f.a/b 双挂）。
+    }
+
+    @Test fun `view gate mq5f on 3180`() {
+        assertEquals("mq5.f", DexProbe.findViewGate("$ws/work/weixin8078android3180_0x28004e32_arm64.apk"))
+    }
+
+    @Test fun `view gate on 3160`() {
+        // 8.0.78 3160 门控与 3180 同构（mq5.f），同断言锁死漂移
+        assertEquals("mq5.f", DexProbe.findViewGate("$ws/work/weixin8078android3160_arm64.apk"))
+    }
 }
